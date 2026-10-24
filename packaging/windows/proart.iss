@@ -20,7 +20,7 @@ PrivilegesRequired=lowest
 
 [Files]
 Source: "..\..\dist\ProArt.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\dist\proart.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\bin\proart.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\ProArt"; Filename: "{app}\ProArt.exe"

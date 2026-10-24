@@ -53,7 +53,7 @@ jobs:
           export PATH="/c/Program Files (x86)/Inno Setup 6:$PATH"
           powershell -ExecutionPolicy Bypass -File packaging/windows/build.ps1
           test -f "dist/ProArt-Setup-$VERSION.exe"
-          (cd dist && 7z a "ProArt-$VERSION-Windows-x64-portable.zip" ProArt.exe proart.exe)
+          (cd dist && 7z a "ProArt-$VERSION-Windows-x64-portable.zip" ProArt.exe bin/proart.exe)
           echo "ASSETS=dist/ProArt-Setup-$VERSION.exe dist/ProArt-$VERSION-Windows-x64-portable.zip" >> "$GITHUB_ENV"
 
       - name: Package (Linux)
