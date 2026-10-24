@@ -1,17 +1,18 @@
 //! The menu-bar / tray popover: quick controls for the current display.
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, img, point, prelude::*, px, size, AnyElement, App, Bounds, Context, FontWeight, ImageSource, IntoElement, Pixels, Render,
+    div, img, point, prelude::*, px, rgba, size, AnyElement, App, Bounds, Context, FontWeight, ImageSource, IntoElement, Pixels, Render,
     SharedString, Subscription, Task, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
 };
 use proart_core::features::{self, Feature};
 use proart_core::manager::{DisplayState, Status};
 
 use crate::actions;
-use crate::controls::{confirm, feature_row, Ctl};
+use crate::controls::{confirm, feature_row, ConfirmFn, Confirmation, Ctl};
 use crate::main_view::toast_stack;
 use crate::state::Shared;
 use crate::theme::Theme;
@@ -48,6 +49,8 @@ pub struct PanelView {
     saw_active: bool,
     opened: Instant,
     last_h: f32,
+    /// A dangerous action waiting for "Continue" (shown over the panel).
+    pending: Option<Confirmation>,
     _activation: Subscription,
     _tick: Task<()>,
 }
@@ -78,7 +81,7 @@ impl PanelView {
                 break;
             }
         });
-        PanelView { seen: 0, had_toasts: false, saw_active: window.is_window_active(), opened: Instant::now(), last_h: 0.0, _activation: activation, _tick: tick }
+        PanelView { seen: 0, had_toasts: false, saw_active: window.is_window_active(), opened: Instant::now(), last_h: 0.0, pending: None, _activation: activation, _tick: tick }
     }
 }
 
@@ -109,7 +112,14 @@ impl Render for PanelView {
             window.resize(size(px(PANEL_W), px(h)));
         }
 
-        let ctl = Ctl { mgr: mgr.clone(), bus: bus.clone(), t, on_learn: None };
+        let me = cx.entity().downgrade();
+        let on_confirm: ConfirmFn = Rc::new(move |c, _, cx| {
+            let _ = me.update(cx, |this, cx| {
+                this.pending = Some(c);
+                cx.notify();
+            });
+        });
+        let ctl = Ctl { mgr: mgr.clone(), bus: bus.clone(), t, on_learn: None, on_confirm: Some(on_confirm.clone()) };
         let probing = st.as_ref().is_some_and(|s| bus.is_probing(s.key()));
         let label = st.as_ref().map(|s| mgr.label(s)).unwrap_or_else(|| "No display detected".into());
         let rows: Vec<AnyElement> = match &st {
@@ -126,10 +136,13 @@ impl Render for PanelView {
             Some(st) => {
                 let presets = mgr.with_settings(|s| s.presets.clone());
                 let (mgr2, bus2, st2) = (mgr.clone(), bus.clone(), st.clone());
-                let off = pill("panel-off", &t, "Turn off", PillKind::Danger).on_click(move |_, window, cx| {
+                let off = pill("panel-off", &t, "Turn off", PillKind::Danger);
+                #[cfg(test)]
+                let off = off.debug_selector(|| "panel-off".into());
+                let off = off.on_click(move |_, window, cx| {
                     let (mgr, bus, st) = (mgr2.clone(), bus2.clone(), st2.clone());
                     let msg = format!("Turn {} off?", mgr.label(&st));
-                    confirm(window, cx, &msg, "You can wake it with its power button.", move || actions::power_async(&mgr, &bus, &st, false));
+                    confirm(Some(&on_confirm), window, cx, &msg, "You can wake it with its power button.", move || actions::power_async(&mgr, &bus, &st, false));
                 });
                 let preset_dd = (!presets.is_empty()).then(|| {
                     let items: Vec<DropItem> = presets.iter().enumerate().map(|(i, p)| DropItem { label: p.name.clone().into(), code: Some(i as u16), selected: false }).collect();
@@ -184,6 +197,55 @@ impl Render for PanelView {
             .child(div().flex().flex_col().flex_1().when(probing && rows.is_empty(), |d| d.child(div().py(px(12.)).text_color(t.dim).child("Reading the monitor\u{2026}"))).children(rows))
             .child(footer)
             .child(toast_stack(&bus, &t))
+            .children(self.confirm_overlay(&t, cx))
+    }
+}
+
+impl PanelView {
+    fn confirm_overlay(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let c = self.pending.as_ref()?;
+        let cancel = pill("confirm-cancel", t, "Cancel", PillKind::Normal);
+        #[cfg(test)]
+        let cancel = cancel.debug_selector(|| "confirm-cancel".into());
+        let cancel = cancel.on_click(cx.listener(|this, _, _, cx| {
+            this.pending = None;
+            cx.notify();
+        }));
+        let go = pill("confirm-continue", t, "Continue", PillKind::Danger);
+        #[cfg(test)]
+        let go = go.debug_selector(|| "confirm-continue".into());
+        let go = go.on_click(cx.listener(|this, _, _, cx| {
+            if let Some(c) = this.pending.take() {
+                (c.then)();
+            }
+            cx.notify();
+        }));
+        Some(
+            div()
+                .id("confirm-overlay")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(16.))
+                .bg(rgba(0x000000a8))
+                .occlude()
+                .child(
+                    div()
+                        .w_full()
+                        .p(px(16.))
+                        .rounded(px(12.))
+                        .bg(t.card)
+                        .border_1()
+                        .border_color(t.border)
+                        .shadow_lg()
+                        .child(div().text_size(px(14.)).font_weight(FontWeight::BOLD).child(c.message.clone()))
+                        .child(div().mt(px(4.)).text_size(px(12.)).text_color(t.dim).child(c.detail))
+                        .child(div().mt(px(14.)).flex().flex_row().justify_end().gap(px(8.)).child(cancel).child(go)),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -194,4 +256,65 @@ pub fn origin_below(cx: &App, x_center: f32, y_top: f32, y_bottom: f32, rows: us
     // taskbar at the bottom (Windows/Linux): open upwards
     let y = if y_top < dh / 2.0 { y_bottom + 4.0 } else { y_top - h - 6.0 };
     point(px(x), px(y))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use gpui::{Bounds, Image, ImageFormat, Modifiers, TestAppContext};
+    use proart_core::backend::fake::FakeBackend;
+    use proart_core::{Manager, Settings};
+
+    use super::*;
+    use crate::main_view::tests::Shared2;
+    use crate::state::Bus;
+
+    fn center(b: Bounds<Pixels>) -> gpui::Point<Pixels> {
+        point(b.origin.x + b.size.width / 2.0, b.origin.y + b.size.height / 2.0)
+    }
+
+    #[gpui::test]
+    fn turn_off_asks_inside_the_panel_then_powers_off(cx: &mut TestAppContext) {
+        let fake = Arc::new(FakeBackend::sample());
+        fake.set_register(0xD6, 1, 4);
+        let mgr = Manager::new(Box::new(Shared2(fake.clone())), Settings::default(), Arc::new(|_| {}));
+        mgr.refresh();
+        mgr.start();
+        cx.update(|cx| cx.set_global(Shared { mgr, bus: Arc::new(Bus::default()), logo: Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())), tray: true }));
+        let (view, cx) = cx.add_window_view(|window, cx| PanelView::new(window, cx));
+        cx.run_until_parked();
+
+        // no native prompt (it would take focus and close the panel): an overlay instead
+        let off = cx.debug_bounds("panel-off").expect("Turn off is drawn");
+        cx.simulate_click(center(off), Modifiers::none());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.pending.is_some()), "confirmation is pending");
+        assert!(!cx.has_pending_prompt(), "no native prompt");
+
+        // Cancel leaves the monitor on
+        let cancel = cx.debug_bounds("confirm-cancel").expect("overlay is drawn");
+        cx.simulate_click(center(cancel), Modifiers::none());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.pending.is_none()));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(fake.register(0xD6).unwrap().0, 1, "still on");
+
+        // Continue sends the power-off command
+        let off = cx.debug_bounds("panel-off").expect("Turn off is drawn");
+        cx.simulate_click(center(off), Modifiers::none());
+        cx.run_until_parked();
+        let go = cx.debug_bounds("confirm-continue").expect("overlay is drawn");
+        cx.simulate_click(center(go), Modifiers::none());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.pending.is_none()));
+        for _ in 0..40 {
+            if fake.register(0xD6).unwrap().0 == 4 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(fake.register(0xD6).unwrap().0, 4, "powered off");
+    }
 }

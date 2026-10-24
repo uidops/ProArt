@@ -15,6 +15,16 @@ use crate::ui::{pill, row, DropItem, Dropdown, PillKind, Slider};
 
 pub type LearnFn = Rc<dyn Fn(Arc<DisplayState>, &'static Feature, &mut Window, &mut App)>;
 
+/// Shows a confirmation inside the view instead of a native prompt. The
+/// menu-bar panel needs this: a prompt takes its focus, which closes it.
+pub type ConfirmFn = Rc<dyn Fn(Confirmation, &mut Window, &mut App)>;
+
+pub struct Confirmation {
+    pub message: SharedString,
+    pub detail: &'static str,
+    pub then: Box<dyn FnOnce()>,
+}
+
 /// Everything a control needs; cheap to clone.
 #[derive(Clone)]
 pub struct Ctl {
@@ -22,12 +32,18 @@ pub struct Ctl {
     pub bus: Arc<Bus>,
     pub t: Theme,
     pub on_learn: Option<LearnFn>,
+    pub on_confirm: Option<ConfirmFn>,
 }
 
-/// Ask first when the user has not turned confirmations off.
-pub fn confirm(window: &mut Window, cx: &mut App, message: &str, detail: &str, then: impl FnOnce() + 'static) {
+/// Ask first when the user has not turned confirmations off: through
+/// `on_confirm` when given, otherwise with a native prompt.
+pub fn confirm(on_confirm: Option<&ConfirmFn>, window: &mut Window, cx: &mut App, message: &str, detail: &'static str, then: impl FnOnce() + 'static) {
     if !cx.global::<Shared>().mgr.with_settings(|s| s.global.confirm_dangerous) {
         then();
+        return;
+    }
+    if let Some(show) = on_confirm {
+        show(Confirmation { message: SharedString::from(message.to_string()), detail, then: Box::new(then) }, window, cx);
         return;
     }
     let rx = window.prompt(
@@ -121,7 +137,7 @@ fn dropdown(ctl: &Ctl, st: &Arc<DisplayState>, f: &'static Feature) -> AnyElemen
         let (mgr, bus, s) = (ctl2.mgr.clone(), ctl2.bus.clone(), s.clone());
         if f.dangerous {
             let msg = format!("Set {} to {name} on {}?", f.label, mgr.label(&s));
-            confirm(window, cx, &msg, "The display may switch signal or lock controls.", move || actions::write_async(&mgr, &bus, &s, f, Some(code)));
+            confirm(ctl2.on_confirm.as_ref(), window, cx, &msg, "The display may switch signal or lock controls.", move || actions::write_async(&mgr, &bus, &s, f, Some(code)));
         } else {
             actions::write_async(&mgr, &bus, &s, f, Some(code));
         }
@@ -136,7 +152,7 @@ fn action(ctl: &Ctl, st: &Arc<DisplayState>, f: &'static Feature) -> AnyElement 
         _ => "Run",
     };
     let kind = if f.dangerous { PillKind::Danger } else { PillKind::Normal };
-    let (mgr, bus, s) = (ctl.mgr.clone(), ctl.bus.clone(), st.clone());
+    let (mgr, bus, s, on_confirm) = (ctl.mgr.clone(), ctl.bus.clone(), st.clone(), ctl.on_confirm.clone());
     pill(SharedString::from(format!("{}:{}:act", st.key(), f.id)), &ctl.t, text, kind)
         .on_click(move |_, window, cx| {
             let (mgr, bus, s) = (mgr.clone(), bus.clone(), s.clone());
@@ -144,7 +160,7 @@ fn action(ctl: &Ctl, st: &Arc<DisplayState>, f: &'static Feature) -> AnyElement 
                 actions::mute_async(&mgr, &s);
             } else if f.dangerous {
                 let msg = format!("{} on {}?", f.label, mgr.label(&s));
-                confirm(window, cx, &msg, "This cannot be undone from here.", move || actions::write_async(&mgr, &bus, &s, f, None));
+                confirm(on_confirm.as_ref(), window, cx, &msg, "This cannot be undone from here.", move || actions::write_async(&mgr, &bus, &s, f, None));
             } else {
                 actions::write_async(&mgr, &bus, &s, f, None);
             }

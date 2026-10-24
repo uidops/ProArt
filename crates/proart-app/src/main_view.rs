@@ -277,7 +277,7 @@ impl Render for MainView {
             })
             .ok();
         });
-        let ctl = Ctl { mgr: mgr.clone(), bus: bus.clone(), t, on_learn: Some(on_learn) };
+        let ctl = Ctl { mgr: mgr.clone(), bus: bus.clone(), t, on_learn: Some(on_learn), on_confirm: None };
 
         let sidebar = self.sidebar(&st, &t, &mgr, logo.clone(), cx);
         let body = self.page_body(&ctl, &st, logo, window, cx);
@@ -388,7 +388,7 @@ impl MainView {
         let off = pill("power-off", t, "Turn off", PillKind::Danger).on_click(cx.listener(move |_, _, window, cx| {
             let (mgr, bus, st) = (mgr.clone(), bus.clone(), s1.clone());
             let msg = format!("Turn {} off?", mgr.label(&st));
-            confirm(window, cx, &msg, "You can wake it with its power button.", move || actions::power_async(&mgr, &bus, &st, false));
+            confirm(None, window, cx, &msg, "You can wake it with its power button.", move || actions::power_async(&mgr, &bus, &st, false));
         }));
         let on = pill("power-on", t, "Turn on", PillKind::Normal).on_click(move |_, _, _| actions::power_async(&mgr2, &bus2, &s2, true));
         div()
@@ -746,7 +746,7 @@ impl MainView {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -758,7 +758,7 @@ mod tests {
     use super::*;
     use crate::state::Bus;
 
-    struct Shared2(Arc<FakeBackend>);
+    pub(crate) struct Shared2(pub(crate) Arc<FakeBackend>);
     impl Backend for Shared2 {
         fn name(&self) -> &'static str {
             "fake"
