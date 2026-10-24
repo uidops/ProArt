@@ -40,6 +40,12 @@ CI (`.github/workflows/ci.yml`) builds and tests all three on native runners.
 
 ## Install
 
+Prebuilt downloads are on the [Releases](https://github.com/uidops/ProArt/releases) page:
+a universal macOS `.dmg`, a Windows installer and portable `.zip`, and a Linux
+`.tar.gz` (extract it and run `./install.sh --system-i2c`).
+
+To build from source:
+
 ```sh
 # macOS: builds dist/ProArt.app and dist/ProArt-<version>-macOS.dmg
 packaging/macos/build.sh

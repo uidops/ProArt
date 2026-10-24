@@ -1,0 +1,75 @@
+name: release
+# Builds the installers on native runners and uploads them to the GitHub release.
+# Runs when a release is published, or by hand for an existing release tag.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and upload to (e.g. v0.2.0)
+        required: true
+permissions:
+  contents: write
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  GH_TOKEN: ${{ github.token }}
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04: older glibc, so the binaries run on more distributions
+        os: [macos-latest, windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Version
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "tag $TAG does not match Cargo.toml version $VERSION" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Package (macOS, universal)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          TARGETS="aarch64-apple-darwin x86_64-apple-darwin" packaging/macos/build.sh
+          echo "ASSETS=dist/ProArt-$VERSION-macOS.dmg" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install innosetup -y --no-progress
+          export PATH="/c/Program Files (x86)/Inno Setup 6:$PATH"
+          powershell -ExecutionPolicy Bypass -File packaging/windows/build.ps1
+          test -f "dist/ProArt-Setup-$VERSION.exe"
+          (cd dist && 7z a "ProArt-$VERSION-Windows-x64-portable.zip" ProArt.exe proart.exe)
+          echo "ASSETS=dist/ProArt-Setup-$VERSION.exe dist/ProArt-$VERSION-Windows-x64-portable.zip" >> "$GITHUB_ENV"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-x11-dev libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-xkb-dev \
+            libx11-xcb-dev libfontconfig-dev libasound2-dev libssl-dev libvulkan-dev pkg-config clang cmake
+          cargo build --release -p proart-app -p proart-cli
+          NAME="ProArt-$VERSION-Linux-x86_64"
+          mkdir -p "dist/$NAME"
+          install -m755 target/release/proart-app target/release/proart packaging/linux/install.sh "dist/$NAME/"
+          install -m644 packaging/linux/proart.desktop packaging/linux/60-proart-i2c.rules LICENSE README.md "dist/$NAME/"
+          install -m644 assets/icons/app-256.png "dist/$NAME/proart.png"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          echo "ASSETS=dist/$NAME.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload to the release
+        run: gh release upload "$TAG" $ASSETS --clobber
