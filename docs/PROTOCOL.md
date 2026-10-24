@@ -100,8 +100,10 @@ these answering. Reads only unless noted.
   ignored (the monitor answers nothing, and the value reads back unchanged);
   in modes 14/15/33 it works. `proart set` reads back after the
   settle time and exits 1 with a "locked in the current picture mode" warning.
-* **0xE6 Blue Light Filter** answers `(0, 255)` but a write of level 1 or 2 had
-  no effect in any of modes 13/14/15/33 (4 s settle). Treat it as unconfirmed.
+* **0xE6 Blue Light Filter** answers `(0, 255)` and reads back the OSD level, but
+  writes (levels 1-3, 4 s settle) are ignored in every mode tried, while the OSD
+  itself changes the level fine. Blue Light is therefore not built in: it is
+  learned per monitor (`proart learn blue_light`).
 
 ### Where the ASUS opcodes come from
 
@@ -122,7 +124,7 @@ channel; the app sleeps 20 ms before each write and serialises all calls;
 per-model support comes from the capabilities string, with built-in strings for
 ProArt monitors that do not answer; ProArt presets live in 0xE3
 (`preset<<8|0xFF`), the rest of the picture settings in 0xDC on older models.
-Built-in opcodes from there (0xE6 blue light, 0xE0 trace free, 0xE1 ASCR /
+Built-in opcodes from there (0xE0 trace free, 0xE1 ASCR /
 power saving by table generation (0xEF), 0xE4 input range, 0xE7 QuickFit,
 0x72 gamma, 0xE3 calibrated preset) are only used when the monitor answers a
 read of them. The Windows `Splendid` table (1-8) does **not** apply to the

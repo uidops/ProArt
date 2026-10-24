@@ -85,7 +85,7 @@ pub fn spectrum_bar(width: Pixels) -> Div {
     bar
 }
 
-pub fn page_title(t: &Theme, title: &str, subtitle: &str, color: Hsla) -> Div {
+pub fn page_title(t: &Theme, title: &str, subtitle: &str, icon: &'static str, color: Hsla) -> Div {
     div()
         .flex()
         .flex_col()
@@ -96,7 +96,7 @@ pub fn page_title(t: &Theme, title: &str, subtitle: &str, color: Hsla) -> Div {
                 .flex_row()
                 .items_center()
                 .gap(px(10.))
-                .child(div().size(px(10.)).rounded_full().bg(color))
+                .child(crate::icons::icon(icon, 24., color))
                 .child(div().text_size(px(24.)).font_weight(FontWeight::BOLD).text_color(t.text).child(title.to_string())),
         )
         .when(!subtitle.is_empty(), |d| d.mt(px(2.)).child(div().text_size(px(13.)).text_color(t.dim).child(subtitle.to_string())))
@@ -108,6 +108,20 @@ pub enum PillKind {
     Normal,
     Primary,
     Danger,
+}
+
+/// A time of day with 15-minute steps: [-] 21:00 [+].
+pub fn time_stepper(id: &str, t: &Theme, minutes: u16, on_change: Rc<dyn Fn(u16, &mut App)>) -> Div {
+    use proart_core::automation::{format_time, step_time};
+    let (dec, inc) = (on_change.clone(), on_change);
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.))
+        .child(pill(SharedString::from(format!("{id}-dec")), t, "\u{2212}", PillKind::Normal).on_click(move |_, _, cx| dec(step_time(minutes, -15), cx)))
+        .child(div().w(px(46.)).flex().justify_center().text_size(px(14.)).font_weight(FontWeight::BOLD).child(format_time(minutes)))
+        .child(pill(SharedString::from(format!("{id}-inc")), t, "+", PillKind::Normal).on_click(move |_, _, cx| inc(step_time(minutes, 15), cx)))
 }
 
 /// Pill-shaped button. The caller attaches `.on_click(..)`.
@@ -139,9 +153,13 @@ pub fn pill(id: impl Into<ElementId>, t: &Theme, text: &str, kind: PillKind) -> 
 
 /// On/off switch. The caller attaches `.on_click(..)`.
 pub fn switch(id: impl Into<ElementId>, t: &Theme, on: bool) -> Stateful<Div> {
-    div()
-        .id(id)
-        .w(px(40.))
+    let id: ElementId = id.into();
+    #[cfg(test)]
+    let label = format!("switch:{id}");
+    let sw = div().id(id);
+    #[cfg(test)]
+    let sw = sw.debug_selector(move || label.clone());
+    sw.w(px(40.))
         .h(px(22.))
         .rounded_full()
         .cursor_pointer()

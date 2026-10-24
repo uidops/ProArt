@@ -6,14 +6,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    div, img, point, prelude::*, px, rgba, size, AnyElement, App, Bounds, Context, Entity, FontWeight, Hsla, ImageSource,
+    div, img, point, prelude::*, px, rgba, size, AnyElement, App, Bounds, Context, Entity, FontWeight, ImageSource,
     IntoElement, Render, SharedString, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use proart_core::features::{self, Group};
 use proart_core::manager::{DisplayState, Manager, Status};
 
 use crate::actions;
-use crate::controls::{confirm, feature_row, Ctl};
+use crate::controls::{confirm, dim_row, feature_row, gamma_row, software_blue_row, warmth_row, Ctl};
+use crate::icons;
 use crate::learn::{LearnState, Snapshot};
 use crate::state::{Bus, Shared, ToastKind};
 use crate::text_field::{FieldEvent, TextField};
@@ -26,6 +27,7 @@ pub enum Page {
     Group(Group),
     Info,
     Presets,
+    Automation,
     Displays,
     Settings,
     About,
@@ -37,6 +39,7 @@ impl Page {
             "overview" => Some(Page::Overview),
             "info" | "information" => Some(Page::Info),
             "presets" => Some(Page::Presets),
+            "automation" => Some(Page::Automation),
             "displays" => Some(Page::Displays),
             "settings" => Some(Page::Settings),
             "about" => Some(Page::About),
@@ -137,7 +140,7 @@ impl MainView {
         mgr.set_live(live);
     }
 
-    fn nav_item(&self, idx: usize, page: Page, label: &str, color: Hsla, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn nav_item(&self, idx: usize, page: Page, label: &str, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.page == page;
         let (hover, sel) = (t.field, t.hover);
         let item = div().id(("nav", idx));
@@ -159,7 +162,7 @@ impl MainView {
                 this.page = page;
                 cx.notify();
             }))
-            .child(div().size(px(9.)).rounded_full().bg(color))
+            .child(icons::icon(icons::for_page(page), 17., if selected { t.text } else { t.dim }))
             .child(label.to_string())
             .into_any_element()
     }
@@ -194,16 +197,16 @@ impl MainView {
         };
 
         let mut idx = 0;
-        let mut next = |page: Page, label: &str, color: Hsla, this: &Self, cx: &mut Context<Self>| {
+        let mut next = |page: Page, label: &str, this: &Self, cx: &mut Context<Self>| {
             idx += 1;
-            this.nav_item(idx, page, label, color, t, cx)
+            this.nav_item(idx, page, label, t, cx)
         };
-        let overview = next(Page::Overview, "Overview", t.accent.into(), self, cx);
-        let groups: Vec<AnyElement> = Group::ALL.iter().map(|g| next(Page::Group(*g), g.label(), group_color(*g), self, cx)).collect();
-        let info = next(Page::Info, "Information", t.dim.into(), self, cx);
-        let app_pages: Vec<AnyElement> = [(Page::Presets, "Presets"), (Page::Displays, "Displays"), (Page::Settings, "Settings"), (Page::About, "About")]
+        let overview = next(Page::Overview, "Overview", self, cx);
+        let groups: Vec<AnyElement> = Group::ALL.iter().map(|g| next(Page::Group(*g), g.label(), self, cx)).collect();
+        let info = next(Page::Info, "Information", self, cx);
+        let app_pages: Vec<AnyElement> = [(Page::Presets, "Presets"), (Page::Automation, "Automation"), (Page::Displays, "Displays"), (Page::Settings, "Settings"), (Page::About, "About")]
             .iter()
-            .map(|(p, l)| next(*p, l, t.dim.into(), self, cx))
+            .map(|(p, l)| next(*p, l, self, cx))
             .collect();
 
         div()
@@ -345,9 +348,9 @@ impl MainView {
         let t = &ctl.t;
         let Some(stv) = st else {
             return match self.page {
-                Page::Presets | Page::Settings | Page::About | Page::Displays => self.app_page(ctl, None, logo, window, cx),
+                Page::Presets | Page::Automation | Page::Settings | Page::About | Page::Displays => self.app_page(ctl, None, logo, window, cx),
                 _ => div()
-                    .child(page_title(t, "ProArt", "", t.accent.into()))
+                    .child(page_title(t, "ProArt", "", icons::for_page(Page::Displays), t.accent.into()))
                     .child(
                         card(t).p(px(18.)).child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).child("No display detected")).child(
                             div().mt(px(4.)).text_color(t.dim).child("Connect an ASUS ProArt monitor over DisplayPort or HDMI and enable DDC/CI in its OSD menu."),
@@ -368,6 +371,7 @@ impl MainView {
         let _ = st;
         match self.page {
             Page::Presets => self.page_presets(ctl, cx),
+            Page::Automation => self.page_automation(ctl, cx),
             Page::Displays => self.page_displays(ctl, cx),
             Page::Settings => self.page_settings(ctl, cx),
             _ => self.page_about(ctl, logo, cx),
@@ -392,7 +396,7 @@ impl MainView {
         }));
         let on = pill("power-on", t, "Turn on", PillKind::Normal).on_click(move |_, _, _| actions::power_async(&mgr2, &bus2, &s2, true));
         div()
-            .child(page_title(t, "Overview", &format!("{}  \u{00b7}  {}\u{00d7}{}", ctl.mgr.label(st), st.info.width, st.info.height), t.accent.into()))
+            .child(page_title(t, "Overview", &format!("{}  \u{00b7}  {}\u{00d7}{}", ctl.mgr.label(st), st.info.width, st.info.height), icons::for_page(Page::Overview), t.accent.into()))
             .when(probing, |d| d.child(div().mb(px(8.)).text_color(t.dim).child("Reading the monitor\u{2026}")))
             .child(section_title(t, "Quick controls"))
             .child(separated(t, rows))
@@ -414,8 +418,21 @@ impl MainView {
         };
         let rows: Vec<AnyElement> = features::in_group(g).filter(|f| ctl.mgr.visible(st, f)).map(|f| feature_row(ctl, st, f)).collect();
         let probing = ctl.bus.is_probing(st.key());
+        let software_rows: Vec<AnyElement> = match g {
+            _ if !ctl.mgr.picture_supported() => Vec::new(),
+            Group::Blue => {
+                let hint = match ctl.mgr.scheduled_kelvin() {
+                    Some(k) => format!("The schedule warms it to {k} K right now (Automation)."),
+                    None => "Warms the picture on this Mac, like Night Shift, while ProArt runs. Works on any monitor.".into(),
+                };
+                vec![software_blue_row(ctl, st, &hint), warmth_row(ctl, st)]
+            }
+            Group::Palette => vec![dim_row(ctl, st), gamma_row(ctl, st)],
+            _ => Vec::new(),
+        };
+        let software = (!software_rows.is_empty()).then(|| div().child(section_title(t, "On this Mac")).child(separated(t, software_rows)));
         div()
-            .child(page_title(t, g.label(), blurb, group_color(g)))
+            .child(page_title(t, g.label(), blurb, icons::for_page(Page::Group(g)), group_color(g)))
             .child(if rows.is_empty() {
                 let msg = if probing {
                     "Reading the monitor\u{2026}".to_string()
@@ -426,6 +443,7 @@ impl MainView {
             } else {
                 separated(t, rows).into_any_element()
             })
+            .children(software)
             .into_any_element()
     }
 
@@ -441,7 +459,7 @@ impl MainView {
         rows.push(("Connection".into(), st.info.backend.clone()));
         rows.extend(ctl.bus.info_rows(st.key()));
         let rows: Vec<AnyElement> = rows.into_iter().map(|(k, v)| row(t, &k, "", div().text_size(px(13.5)).text_color(t.dim).child(v)).into_any_element()).collect();
-        div().child(page_title(t, "Information", "Read from the monitor over DDC/CI", t.dim.into())).child(separated(t, rows)).into_any_element()
+        div().child(page_title(t, "Information", "Read from the monitor over DDC/CI", icons::for_page(Page::Info), t.dim.into())).child(separated(t, rows)).into_any_element()
     }
 
     fn page_presets(&mut self, ctl: &Ctl, cx: &mut Context<Self>) -> AnyElement {
@@ -475,7 +493,7 @@ impl MainView {
             })
             .collect();
         div()
-            .child(page_title(t, "Presets", "Snapshots of every setting, per display", t.accent.into()))
+            .child(page_title(t, "Presets", "Snapshots of every setting, per display", icons::for_page(Page::Presets), t.accent.into()))
             .child(section_title(t, "Save the current settings"))
             .child(card(t).child(row(t, "Name", "", div().flex().flex_row().items_center().gap(px(8.)).child(self.preset_name.clone()).child(save))))
             .child(section_title(t, "Saved"))
@@ -485,6 +503,236 @@ impl MainView {
                 separated(t, rows).into_any_element()
             })
             .into_any_element()
+    }
+
+    fn page_automation(&mut self, ctl: &Ctl, _cx: &mut Context<Self>) -> AnyElement {
+        #[cfg(target_os = "macos")]
+        use proart_core::automation::AppPreset;
+        use proart_core::automation::{AmbientSource, TimedPreset};
+        let t = &ctl.t;
+        let (mgr, bus) = (ctl.mgr.clone(), ctl.bus.clone());
+        let a = mgr.with_settings(|s| s.automation.clone());
+        let presets = mgr.with_settings(|s| s.presets.clone());
+        // every control edits the settings, saves and repaints
+        let edit = {
+            let (mgr, bus) = (mgr.clone(), bus.clone());
+            Rc::new(move |f: &dyn Fn(&mut proart_core::Settings)| {
+                mgr.with_settings(|s| f(s));
+                mgr.save_settings();
+                bus.repaint();
+            })
+        };
+        let toggle = |id: &'static str, title: &str, hint: &str, on: bool, apply: fn(&mut proart_core::Settings)| -> AnyElement {
+            let edit = edit.clone();
+            row(t, title, hint, switch(id, t, on).on_click(move |_, _, _| edit(&apply))).into_any_element()
+        };
+        let preset_picker = |id: SharedString, selected: &str, on_pick: Rc<dyn Fn(String)>| -> AnyElement {
+            let ids: Vec<String> = presets.iter().map(|p| p.id.clone()).collect();
+            let items: Vec<DropItem> = presets.iter().enumerate().map(|(i, p)| DropItem { label: p.name.clone().into(), code: Some(i as u16), selected: p.id == selected }).collect();
+            let label = presets.iter().find(|p| p.id == selected).map(|p| p.name.clone()).unwrap_or_else(|| "Choose a preset".into());
+            Dropdown::new(id, t, label, items, Rc::new(move |i, _, _| on_pick(ids[i as usize].clone()))).into_any_element()
+        };
+
+        // -- blue-light schedule
+        let b = a.blue_schedule.clone();
+        let stepper = |id: &str, minutes: u16, set: fn(&mut proart_core::Settings, u16)| {
+            let edit = edit.clone();
+            crate::ui::time_stepper(id, t, minutes, Rc::new(move |m, _| edit(&move |s| set(s, m))))
+        };
+        let levels: Vec<DropItem> = (1..=proart_core::tint::MAX_LEVEL)
+            .map(|l| DropItem { label: proart_core::tint::LEVELS[l as usize].into(), code: Some(l as u16), selected: proart_core::tint::level_kelvin(l) == b.kelvin })
+            .collect();
+        let level_label = (1..=proart_core::tint::MAX_LEVEL).find(|l| proart_core::tint::level_kelvin(*l) == b.kelvin).map(|l| proart_core::tint::LEVELS[l as usize].to_string()).unwrap_or_else(|| format!("{} K", b.kelvin));
+        let e = edit.clone();
+        let warmth = Dropdown::new("sched-warmth", t, level_label, levels, Rc::new(move |l, _, _| e(&move |s| s.automation.blue_schedule.kelvin = proart_core::tint::level_kelvin(l as u8))));
+        let fades = [0u16, 10, 20, 30, 60];
+        let fade_items: Vec<DropItem> = fades.iter().enumerate().map(|(i, m)| DropItem { label: format!("{m} min").into(), code: Some(i as u16), selected: *m == b.fade_min }).collect();
+        let e = edit.clone();
+        let fade = Dropdown::new("sched-fade", t, format!("{} min", b.fade_min), fade_items, Rc::new(move |i, _, _| e(&move |s| s.automation.blue_schedule.fade_min = fades[i as usize])));
+        let sched_hint = match mgr.scheduled_kelvin() {
+            Some(k) => format!("Active now: {k} K"),
+            None => "Warms every monitor in software between these times, fading in and out.".into(),
+        };
+        let schedule = separated(
+            t,
+            vec![
+                toggle("sched-on", "Blue light schedule", &sched_hint, b.enabled, |s| s.automation.blue_schedule.enabled = !s.automation.blue_schedule.enabled),
+                row(t, "From", "", stepper("sched-start", b.start, |s, m| s.automation.blue_schedule.start = m)).into_any_element(),
+                row(t, "To", "", stepper("sched-end", b.end, |s, m| s.automation.blue_schedule.end = m)).into_any_element(),
+                row(t, "Warmth", "", warmth).into_any_element(),
+                row(t, "Fade", "", fade).into_any_element(),
+            ],
+        );
+
+        // -- presets at set times
+        let mut timed_rows: Vec<AnyElement> = a
+            .timed_presets
+            .iter()
+            .enumerate()
+            .map(|(i, tp)| {
+                let id = tp.id.clone();
+                let e = edit.clone();
+                let i2 = id.clone();
+                let time = crate::ui::time_stepper(&format!("timed-{i}"), t, tp.at, Rc::new(move |m, _| {
+                    let i2 = i2.clone();
+                    e(&move |s| s.automation.timed_presets.iter_mut().filter(|x| x.id == i2).for_each(|x| x.at = m))
+                }));
+                let e = edit.clone();
+                let i3 = id.clone();
+                let pick = preset_picker(SharedString::from(format!("timed-preset-{i}")), &tp.preset, Rc::new(move |p| {
+                    let i3 = i3.clone();
+                    e(&move |s| s.automation.timed_presets.iter_mut().filter(|x| x.id == i3).for_each(|x| x.preset = p.clone()))
+                }));
+                let e = edit.clone();
+                let del = pill(("timed-del", i), t, "Delete", PillKind::Danger).on_click(move |_, _, _| {
+                    let id = id.clone();
+                    e(&move |s| s.automation.timed_presets.retain(|x| x.id != id))
+                });
+                row(t, "Every day at", "", div().flex().flex_row().items_center().gap(px(8.)).child(time).child(pick).child(del)).into_any_element()
+            })
+            .collect();
+        let first_preset = presets.first().map(|p| p.id.clone());
+        timed_rows.push(match first_preset.clone() {
+            Some(first) => {
+                let e = edit.clone();
+                let add = pill("timed-add", t, "Add", PillKind::Primary).on_click(move |_, _, _| {
+                    let first = first.clone();
+                    e(&move |s| {
+                        let id = format!("t{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+                        s.automation.timed_presets.push(TimedPreset { id, enabled: true, at: 20 * 60, preset: first.clone() });
+                    })
+                });
+                row(t, "Apply a preset at a time", "Missed while the Mac sleeps? The latest one is applied on wake.", add).into_any_element()
+            }
+            None => row(t, "Apply a preset at a time", "Save a preset on the Presets page first.", div()).into_any_element(),
+        });
+
+        // -- presets per app
+        #[allow(unused_mut)]
+        let mut app_rows: Vec<AnyElement> = Vec::new();
+        #[cfg(target_os = "macos")]
+        {
+            for (i, ap) in a.app_presets.iter().enumerate() {
+                let e = edit.clone();
+                let bundle = ap.bundle_id.clone();
+                let b2 = bundle.clone();
+                let pick = preset_picker(SharedString::from(format!("app-preset-{i}")), &ap.preset, Rc::new(move |p| {
+                    let b2 = b2.clone();
+                    e(&move |s| s.automation.app_presets.iter_mut().filter(|x| x.bundle_id == b2).for_each(|x| x.preset = p.clone()))
+                }));
+                let e = edit.clone();
+                let del = pill(("app-del", i), t, "Delete", PillKind::Danger).on_click(move |_, _, _| {
+                    let bundle = bundle.clone();
+                    e(&move |s| s.automation.app_presets.retain(|x| x.bundle_id != bundle))
+                });
+                app_rows.push(row(t, &ap.name, &ap.bundle_id, div().flex().flex_row().items_center().gap(px(8.)).child(pick).child(del)).into_any_element());
+            }
+            let own = crate::mac::own_bundle_id();
+            let apps: Vec<crate::mac::AppInfo> = crate::mac::running_apps()
+                .into_iter()
+                .filter(|app| Some(&app.bundle_id) != own.as_ref() && !a.app_presets.iter().any(|r| r.bundle_id == app.bundle_id))
+                .collect();
+            let items: Vec<DropItem> = apps.iter().enumerate().map(|(i, app)| DropItem { label: app.name.clone().into(), code: Some(i as u16), selected: false }).collect();
+            let e = edit.clone();
+            let first = first_preset.clone().unwrap_or_default();
+            let add = Dropdown::new("app-add", t, "Add a running app", items, Rc::new(move |i, _, _| {
+                let (app, first) = (apps[i as usize].clone(), first.clone());
+                e(&move |s| s.automation.app_presets.push(AppPreset { bundle_id: app.bundle_id.clone(), name: app.name.clone(), preset: first.clone() }))
+            }));
+            app_rows.push(row(t, "Apply a preset while an app is in front", "Your settings come back when you switch to another app.", add).into_any_element());
+        }
+
+        // -- keyboard
+        #[allow(unused_mut)]
+        let mut key_rows: Vec<AnyElement> = Vec::new();
+        #[cfg(target_os = "macos")]
+        {
+            key_rows.push(toggle("keys-brightness", "Brightness keys", "For the monitor the pointer is on; the built-in display keeps its own.", a.keys.brightness, |s| {
+                s.automation.keys.brightness = !s.automation.keys.brightness;
+                if s.automation.keys.brightness {
+                    crate::mac::accessibility_trusted(true);
+                }
+            }));
+            key_rows.push(toggle("keys-volume", "Volume and mute keys", "While sound plays through the monitor (HDMI or DisplayPort).", a.keys.volume, |s| {
+                s.automation.keys.volume = !s.automation.keys.volume;
+                if s.automation.keys.volume {
+                    crate::mac::accessibility_trusted(true);
+                }
+            }));
+            if a.keys.brightness || a.keys.volume {
+                let trusted = crate::mac::accessibility_trusted(false);
+                let (hint, button) = if trusted && crate::media_keys::active() {
+                    ("Working.", None)
+                } else if trusted {
+                    ("Starting\u{2026}", None)
+                } else {
+                    ("macOS needs to allow ProArt under Privacy & Security > Accessibility. After an update, remove ProArt there and add it again.", Some(pill("keys-allow", t, "Open Settings", PillKind::Primary).on_click(|_, _, _| crate::mac::open_accessibility_settings())))
+                };
+                key_rows.push(row(t, "Permission", hint, div().children(button)).into_any_element());
+            }
+        }
+
+        // -- ambient light
+        let am = a.ambient.clone();
+        let sources = [(AmbientSource::Sensor, "Light sensor"), (AmbientSource::Builtin, "Built-in display")];
+        let src_items: Vec<DropItem> = sources.iter().enumerate().map(|(i, (v, l))| DropItem { label: (*l).into(), code: Some(i as u16), selected: *v == am.source }).collect();
+        let src_label = sources.iter().find(|(v, _)| *v == am.source).map(|(_, l)| *l).unwrap_or("Light sensor");
+        let e = edit.clone();
+        let source = Dropdown::new("ambient-source", t, src_label, src_items, Rc::new(move |i, _, _| e(&move |s| s.automation.ambient.source = sources[i as usize].0)));
+        let level_slider = |id: &'static str, value: u8, set: fn(&mut proart_core::Settings, u8)| -> AnyElement {
+            let (e2, m) = (edit.clone(), mgr.clone());
+            let on_change: crate::ui::FracFn = Rc::new(move |fr, _, _| m.with_settings(|s| set(s, (fr * 100.0).round() as u8)));
+            let on_commit: crate::ui::FracFn = Rc::new(move |fr, _, _| e2(&move |s| set(s, (fr * 100.0).round() as u8)));
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.))
+                .child(div().w(px(40.)).text_size(px(13.)).text_color(t.dim).flex().justify_end().child(format!("{value} %")))
+                .child(crate::ui::Slider::new(id, t, value as f32 / 100.0, true, on_change, on_commit))
+                .into_any_element()
+        };
+        let reading = match (am.enabled, mgr.ambient_reading()) {
+            (false, _) => "Monitor brightness follows the room's light. Your own changes are kept as an offset.".to_string(),
+            (true, Some(r)) if r.source == AmbientSource::Sensor => format!("Now {:.0} lux \u{2192} {} %", r.input, r.target),
+            (true, Some(r)) => format!("Built-in display at {:.0} % \u{2192} {} %", r.input * 100.0, r.target),
+            (true, None) if am.source == AmbientSource::Sensor => "No reading: the sensor is covered while the lid is closed.".into(),
+            (true, None) => "No reading: the built-in display is off (lid closed).".into(),
+        };
+        let ambient = separated(
+            t,
+            vec![
+                toggle("ambient-on", "Follow ambient light", &reading, am.enabled, |s| s.automation.ambient.enabled = !s.automation.ambient.enabled),
+                row(t, "Source", "The built-in display follows the sensor when macOS adjusts brightness automatically.", source).into_any_element(),
+                row(t, "Darkest", "Brightness in a dark room", level_slider("ambient-min", am.min, |s, v| s.automation.ambient.min = v)).into_any_element(),
+                row(t, "Brightest", "Brightness in daylight", level_slider("ambient-max", am.max, |s, v| s.automation.ambient.max = v)).into_any_element(),
+            ],
+        );
+
+        // -- sleep and wake
+        let power = separated(
+            t,
+            vec![
+                toggle("power-sleep", "Turn monitors off when the Mac sleeps or locks", "Uses the monitor's standby, so a signal still wakes it.", a.power.off_on_sleep, |s| {
+                    s.automation.power.off_on_sleep = !s.automation.power.off_on_sleep
+                }),
+                toggle("power-wake", "Turn them on when the Mac wakes", "", a.power.on_on_wake, |s| s.automation.power.on_on_wake = !s.automation.power.on_on_wake),
+            ],
+        );
+
+        let mut page = div()
+            .child(page_title(t, "Automation", "Let ProArt change things for you", icons::for_page(Page::Automation), t.accent.into()))
+            .child(section_title(t, "Blue light schedule"))
+            .child(schedule)
+            .child(section_title(t, "Presets at set times"))
+            .child(separated(t, timed_rows));
+        if !app_rows.is_empty() {
+            page = page.child(section_title(t, "Presets per app")).child(separated(t, app_rows));
+        }
+        if !key_rows.is_empty() {
+            page = page.child(section_title(t, "Keyboard")).child(separated(t, key_rows));
+        }
+        page.child(section_title(t, "Ambient light")).child(ambient).child(section_title(t, "Sleep and wake")).child(power).into_any_element()
     }
 
     fn name_field(&mut self, st: &Arc<DisplayState>, ctl: &Ctl, cx: &mut Context<Self>) -> Entity<TextField> {
@@ -515,7 +763,7 @@ impl MainView {
     fn page_displays(&mut self, ctl: &Ctl, cx: &mut Context<Self>) -> AnyElement {
         let t = &ctl.t;
         let displays = ctl.mgr.displays();
-        let mut out = div().child(page_title(t, "Displays", "Names and what was learned from each monitor", t.accent.into()));
+        let mut out = div().child(page_title(t, "Displays", "Names and what was learned from each monitor", icons::for_page(Page::Displays), t.accent.into()));
         if displays.is_empty() {
             return out.child(card(t).py(px(16.)).child(div().text_color(t.dim).child("No display detected."))).into_any_element();
         }
@@ -628,7 +876,7 @@ impl MainView {
             .collect();
 
         div()
-            .child(page_title(t, "Settings", "How ProArt looks and behaves", t.accent.into()))
+            .child(page_title(t, "Settings", "How ProArt looks and behaves", icons::for_page(Page::Settings), t.accent.into()))
             .child(section_title(t, "Appearance"))
             .child(card(t).child(row(t, "Theme", "Automatic follows the system", theme_dd)))
             .child(section_title(t, "Behaviour"))
@@ -652,7 +900,7 @@ impl MainView {
         let reveal_path = path.clone();
         let reveal = pill("reveal", t, "Reveal", PillKind::Normal).on_click(cx.listener(move |_, _, _, cx| cx.reveal_path(&reveal_path)));
         div()
-            .child(page_title(t, "About", "", t.dim.into()))
+            .child(page_title(t, "About", "", icons::for_page(Page::About), t.dim.into()))
             .child(separated(
                 t,
                 vec![
@@ -769,10 +1017,23 @@ pub(crate) mod tests {
         fn open_session(&self, i: &DisplayInfo) -> Option<Box<dyn Session>> {
             self.0.open_session(i)
         }
+        fn supports_picture(&self) -> bool {
+            self.0.supports_picture()
+        }
+        fn set_picture(&self, i: &DisplayInfo, p: &proart_core::tint::SoftPicture) -> bool {
+            self.0.set_picture(i, p)
+        }
+    }
+
+    /// Keep test runs away from the user's settings (proart-core is not built
+    /// with `cfg(test)` here, so its own guard does not apply).
+    pub(crate) fn isolate_settings() {
+        std::env::set_var("PROART_CONFIG_DIR", std::env::temp_dir().join(format!("proart-app-test-{}", std::process::id())));
     }
 
     /// A MainView over a fake PA278QV, with the app globals installed.
     fn setup(cx: &mut TestAppContext, page: Page) -> (Arc<FakeBackend>, Arc<Manager>, Entity<MainView>, &mut VisualTestContext) {
+        isolate_settings();
         let fake = Arc::new(FakeBackend::sample());
         fake.rename(0, "PA278QV");
         fake.set_register(0xDC, 13, 35);
@@ -819,6 +1080,55 @@ pub(crate) mod tests {
         std::thread::sleep(Duration::from_millis(500)); // write queue debounce
         let now = fake.register(0x10).unwrap().0;
         assert!(now > 80 && now <= 100, "brightness moved to the right end of the slider, got {now}");
+    }
+
+    #[gpui::test]
+    fn the_software_blue_light_filter_tints_the_display(cx: &mut TestAppContext) {
+        let (fake, mgr, _view, cx) = setup(cx, Page::Group(Group::Blue));
+        let key = mgr.displays()[0].key().to_string();
+        let btn = cx
+            .debug_bounds(Box::leak(format!("dd-btn:{:?}", gpui::ElementId::from(SharedString::from(format!("{key}:software_blue:dd")))).into_boxed_str()))
+            .expect("software filter is drawn on the Blue Light page");
+        cx.simulate_click(center(btn), Modifiers::none());
+        cx.run_until_parked();
+        let item = cx.debug_bounds("dd-item:3").expect("levels are listed");
+        cx.simulate_click(center(item), Modifiers::none());
+        cx.run_until_parked();
+        let p = mgr.software_picture(&mgr.displays()[0]);
+        assert_eq!(p.level(), Some(3));
+        assert_eq!(fake.pictures.lock().unwrap()[&key], p);
+    }
+
+    #[gpui::test]
+    fn the_palette_page_offers_dimming_and_gamma(cx: &mut TestAppContext) {
+        let (fake, mgr, _view, cx) = setup(cx, Page::Group(Group::Palette));
+        let key = mgr.displays()[0].key().to_string();
+        let btn = cx
+            .debug_bounds(Box::leak(format!("dd-btn:{:?}", gpui::ElementId::from(SharedString::from(format!("{key}:software_gamma:dd")))).into_boxed_str()))
+            .expect("gamma is drawn on the Palette page");
+        cx.simulate_click(center(btn), Modifiers::none());
+        cx.run_until_parked();
+        let item = cx.debug_bounds("dd-item:3").expect("gammas are listed");
+        cx.simulate_click(center(item), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(mgr.software_picture(&mgr.displays()[0]).gamma, 2.4);
+        assert_eq!(fake.pictures.lock().unwrap()[&key].gamma, 2.4);
+        let dim = cx.debug_bounds(Box::leak(format!("slider:{:?}", gpui::ElementId::from(SharedString::from(format!("{key}:software_dim")))).into_boxed_str()));
+        assert!(dim.is_some(), "extra dimming slider is drawn");
+    }
+
+    #[gpui::test]
+    fn the_automation_page_turns_the_schedule_on(cx: &mut TestAppContext) {
+        let (_fake, mgr, _view, cx) = setup(cx, Page::Automation);
+        assert!(!mgr.with_settings(|s| s.automation.blue_schedule.enabled));
+        let sw = cx.debug_bounds("switch:sched-on").expect("schedule switch is drawn");
+        cx.simulate_click(center(sw), Modifiers::none());
+        cx.run_until_parked();
+        assert!(mgr.with_settings(|s| s.automation.blue_schedule.enabled));
+        let inc = cx.debug_bounds("switch:ambient-on").expect("ambient switch is drawn");
+        cx.simulate_click(center(inc), Modifiers::none());
+        cx.run_until_parked();
+        assert!(mgr.with_settings(|s| s.automation.ambient.enabled));
     }
 
     #[gpui::test]

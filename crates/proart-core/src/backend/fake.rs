@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use super::{Backend, DisplayInfo, Session};
 use crate::ddc::VcpReply;
+use crate::tint::SoftPicture;
 
 /// Shared register file: opcode -> (current, max).
 pub type Store = Arc<Mutex<HashMap<u8, (u16, u16)>>>;
@@ -14,11 +15,16 @@ pub struct FakeBackend {
     pub store: Store,
     /// Registers that accept a write frame but ignore it (mode-locked controls).
     pub locked: Arc<Mutex<HashSet<u8>>>,
+    /// Last software picture per display key.
+    pub pictures: Mutex<HashMap<String, SoftPicture>>,
+    /// What the automation hooks report.
+    pub lux: Mutex<Option<f32>>,
+    pub idle: Mutex<Option<bool>>,
 }
 
 impl FakeBackend {
     pub fn empty() -> Self {
-        FakeBackend { displays: Mutex::new(Vec::new()), store: Store::default(), locked: Arc::default() }
+        FakeBackend { displays: Mutex::new(Vec::new()), store: Store::default(), locked: Arc::default(), pictures: Mutex::default(), lux: Mutex::default(), idle: Mutex::default() }
     }
 
     /// Two displays sharing one register file, brightness/contrast/volume preset.
@@ -90,5 +96,22 @@ impl Backend for FakeBackend {
 
     fn open_session(&self, _info: &DisplayInfo) -> Option<Box<dyn Session>> {
         Some(Box::new(FakeSession(self.store.clone(), self.locked.clone())))
+    }
+
+    fn supports_picture(&self) -> bool {
+        true
+    }
+
+    fn set_picture(&self, info: &DisplayInfo, picture: &SoftPicture) -> bool {
+        self.pictures.lock().unwrap().insert(info.key.clone(), *picture);
+        true
+    }
+
+    fn ambient_lux(&self) -> Option<f32> {
+        *self.lux.lock().unwrap()
+    }
+
+    fn screens_idle(&self) -> Option<bool> {
+        *self.idle.lock().unwrap()
     }
 }

@@ -24,6 +24,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use super::{Backend, DisplayInfo, GuardedSession, Session, Transport};
+use crate::tint::SoftPicture;
 use crate::ddc::{
     build_get_request, build_set_request, parse_edid, parse_vcp_reply, parse_vcp_reply_unchecked,
     VcpReply, DDC_CHIP, DDC_REGISTER, VCP_BRIGHTNESS,
@@ -38,7 +39,16 @@ extern "C" {
     fn CFRelease(cf: *const c_void);
     fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
     fn CFDataGetLength(data: *const c_void) -> isize;
+    fn CFStringCreateWithCString(alloc: *const c_void, s: *const c_char, encoding: u32) -> *const c_void;
+    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    fn CFBooleanGetValue(b: *const c_void) -> u8;
+    fn CFNumberGetValue(n: *const c_void, kind: i32, out: *mut c_void) -> u8;
+    fn CFArrayGetCount(a: *const c_void) -> isize;
+    fn CFArrayGetValueAtIndex(a: *const c_void, i: isize) -> *const c_void;
 }
+
+const UTF8: u32 = 0x0800_0100;
+const CF_SINT64: i32 = 4;
 
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
@@ -59,7 +69,10 @@ extern "C" {
     fn CGDisplayPixelsHigh(id: u32) -> usize;
     fn CGGetDisplayTransferByTable(id: u32, cap: u32, r: *mut f32, g: *mut f32, b: *mut f32, n: *mut u32) -> i32;
     fn CGSetDisplayTransferByTable(id: u32, n: u32, r: *const f32, g: *const f32, b: *const f32) -> i32;
-    fn CGDisplayRestoreColorSyncSettings();
+    fn CGGetActiveDisplayList(max: u32, ids: *mut u32, count: *mut u32) -> i32;
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayIsAsleep(id: u32) -> u32;
+    fn CGSessionCopyCurrentDictionary() -> *const c_void;
 }
 
 const DDC_WAIT: Duration = Duration::from_millis(50);
@@ -134,7 +147,8 @@ impl Drop for AvHandle {
 
 struct AvTransport {
     handle: Arc<AvHandle>,
-    gamma: Option<Gamma>,
+    /// Software dimming was applied (undone when the session closes).
+    dimmed: bool,
     cg_id: u32,
 }
 
@@ -179,44 +193,184 @@ impl Transport for AvTransport {
     }
 
     fn software_level(&mut self, level: u8) -> bool {
-        let g = self.gamma.get_or_insert_with(|| Gamma::capture(self.cg_id));
-        g.apply(self.cg_id, level)
+        self.dimmed = true;
+        gamma::set_level(self.cg_id, level)
     }
 }
 
 impl Drop for AvTransport {
     fn drop(&mut self) {
-        if let Some(g) = &self.gamma {
-            g.restore(self.cg_id);
+        if self.dimmed {
+            gamma::set_level(self.cg_id, 100);
         }
     }
 }
 
-// ------------------------------------------------------------- gamma fallback --
+// ---------------------------------------------------------------- gamma tables --
 
-struct Gamma {
-    base: Option<[Vec<f32>; 3]>,
+/// Software dimming (for displays that ignore DDC brightness) and the software
+/// blue-light tint share each display's transfer table, so both are kept here
+/// per display and combined over the table captured before the first change.
+/// Quartz restores the user's tables itself when the process exits.
+mod gamma {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use super::{CGGetDisplayTransferByTable, CGSetDisplayTransferByTable};
+
+    struct State {
+        base: [Vec<f32>; 3],
+        level: f32,
+        gains: [f32; 3],
+        exponent: f32,
+    }
+
+    fn states() -> &'static Mutex<HashMap<u32, State>> {
+        static STATES: OnceLock<Mutex<HashMap<u32, State>>> = OnceLock::new();
+        STATES.get_or_init(Mutex::default)
+    }
+
+    fn capture(id: u32) -> Option<[Vec<f32>; 3]> {
+        let (mut r, mut g, mut b) = (vec![0f32; 256], vec![0f32; 256], vec![0f32; 256]);
+        let mut n = 0u32;
+        let ok = unsafe { CGGetDisplayTransferByTable(id, 256, r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), &mut n) } == 0;
+        if !ok || n == 0 {
+            return None;
+        }
+        for ch in [&mut r, &mut g, &mut b] {
+            ch.truncate(n as usize);
+        }
+        Some([r, g, b])
+    }
+
+    fn update(id: u32, change: impl FnOnce(&mut State)) -> bool {
+        let mut map = states().lock().unwrap();
+        if !map.contains_key(&id) {
+            let Some(base) = capture(id) else { return false };
+            map.insert(id, State { base, level: 1.0, gains: [1.0; 3], exponent: 1.0 });
+        }
+        let st = map.get_mut(&id).unwrap();
+        change(st);
+        let table: Vec<Vec<f32>> =
+            (0..3).map(|c| st.base[c].iter().map(|v| (v.max(0.0).powf(st.exponent) * st.level * st.gains[c]).clamp(0.0, 1.0)).collect()).collect();
+        let n = table[0].len() as u32;
+        unsafe { CGSetDisplayTransferByTable(id, n, table[0].as_ptr(), table[1].as_ptr(), table[2].as_ptr()) == 0 }
+    }
+
+    /// Software dimming, 0-100.
+    pub fn set_level(id: u32, level: u8) -> bool {
+        update(id, |st| st.level = level.min(100) as f32 / 100.0)
+    }
+
+    /// Warmth and extra dimming as channel gains, gamma as an exponent.
+    pub fn set_picture(id: u32, gains: [f32; 3], exponent: f32) -> bool {
+        update(id, |st| {
+            st.gains = gains.map(|g| g.clamp(0.0, 1.0));
+            st.exponent = exponent.clamp(0.3, 3.0);
+        })
+    }
 }
 
-impl Gamma {
-    fn capture(id: u32) -> Gamma {
-        let n = 256u32;
-        let (mut r, mut g, mut b) = (vec![0f32; 256], vec![0f32; 256], vec![0f32; 256]);
-        let mut size = 0u32;
-        let ok = unsafe { CGGetDisplayTransferByTable(id, n, r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), &mut size) } == 0;
-        Gamma { base: ok.then_some([r, g, b]) }
+// ------------------------------------------------------- session and sensor --
+
+/// The built-in display, if it is on (not in clamshell mode).
+fn active_builtin() -> Option<u32> {
+    let mut ids = [0u32; 16];
+    let mut n = 0u32;
+    if unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) } != 0 {
+        return None;
+    }
+    ids[..n as usize].iter().copied().find(|id| unsafe { CGDisplayIsBuiltin(*id) } != 0)
+}
+
+fn session_locked() -> bool {
+    unsafe {
+        let dict = CGSessionCopyCurrentDictionary();
+        if dict.is_null() {
+            return false;
+        }
+        let key = CFStringCreateWithCString(std::ptr::null(), c"CGSSessionScreenIsLocked".as_ptr(), UTF8);
+        let value = CFDictionaryGetValue(dict, key);
+        let locked = !value.is_null() && CFBooleanGetValue(value) != 0;
+        CFRelease(key);
+        CFRelease(dict);
+        locked
+    }
+}
+
+/// The ambient light sensor through IOKit's HID event system (the
+/// headerless API ambient-brightness apps use on Apple Silicon).
+mod ambient {
+    use std::ffi::c_void;
+    use std::sync::{Mutex, OnceLock};
+
+    use super::{CFArrayGetCount, CFArrayGetValueAtIndex, CFNumberGetValue, CFRelease, CFStringCreateWithCString, CF_SINT64, UTF8};
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOHIDEventSystemClientCreate(alloc: *const c_void) -> *mut c_void;
+        fn IOHIDEventSystemClientCopyServices(client: *mut c_void) -> *const c_void;
+        fn IOHIDServiceClientCopyProperty(service: *const c_void, key: *const c_void) -> *const c_void;
+        fn IOHIDServiceClientCopyEvent(service: *const c_void, kind: i64, options: i32, timestamp: i64) -> *const c_void;
+        fn IOHIDEventGetFloatValue(event: *const c_void, field: i32) -> f64;
     }
 
-    fn apply(&self, id: u32, level: u8) -> bool {
-        let Some(base) = &self.base else { return false };
-        let f = level.min(100) as f32 / 100.0;
-        let scaled: Vec<Vec<f32>> = base.iter().map(|ch| ch.iter().map(|v| (v * f).min(1.0)).collect()).collect();
-        unsafe { CGSetDisplayTransferByTable(id, 256, scaled[0].as_ptr(), scaled[1].as_ptr(), scaled[2].as_ptr()) == 0 }
+    const EVENT_AMBIENT_LIGHT: i64 = 12;
+    const SENSOR_PAGE: i64 = 0xff00;
+    const SENSOR_USAGE: i64 = 4;
+
+    struct Sensor(*const c_void);
+    // the service client is only used under the mutex
+    unsafe impl Send for Sensor {}
+
+    fn sensor() -> &'static Mutex<Option<Sensor>> {
+        static SENSOR: OnceLock<Mutex<Option<Sensor>>> = OnceLock::new();
+        SENSOR.get_or_init(|| Mutex::new(find()))
     }
 
-    fn restore(&self, _id: u32) {
-        if self.base.is_some() {
-            unsafe { CGDisplayRestoreColorSyncSettings() };
+    fn number(service: *const c_void, name: &std::ffi::CStr) -> Option<i64> {
+        unsafe {
+            let key = CFStringCreateWithCString(std::ptr::null(), name.as_ptr(), UTF8);
+            let value = IOHIDServiceClientCopyProperty(service, key);
+            CFRelease(key);
+            if value.is_null() {
+                return None;
+            }
+            let mut out = 0i64;
+            let ok = CFNumberGetValue(value, CF_SINT64, &mut out as *mut i64 as *mut c_void) != 0;
+            CFRelease(value);
+            ok.then_some(out)
+        }
+    }
+
+    fn find() -> Option<Sensor> {
+        unsafe {
+            let client = IOHIDEventSystemClientCreate(std::ptr::null());
+            if client.is_null() {
+                return None;
+            }
+            let services = IOHIDEventSystemClientCopyServices(client);
+            if services.is_null() {
+                return None;
+            }
+            (0..CFArrayGetCount(services)).map(|i| CFArrayGetValueAtIndex(services, i)).find(|s| {
+                number(*s, c"PrimaryUsagePage") == Some(SENSOR_PAGE) && number(*s, c"PrimaryUsage") == Some(SENSOR_USAGE)
+            }).map(Sensor)
+            // client and services stay alive for the process: the service is used from them
+        }
+    }
+
+    pub fn lux() -> Option<f32> {
+        let guard = sensor().lock().unwrap();
+        let s = guard.as_ref()?;
+        unsafe {
+            let event = IOHIDServiceClientCopyEvent(s.0, EVENT_AMBIENT_LIGHT, 0, 0);
+            if event.is_null() {
+                return None;
+            }
+            let lux = IOHIDEventGetFloatValue(event, (EVENT_AMBIENT_LIGHT << 16) as i32);
+            CFRelease(event);
+            Some(lux as f32)
         }
     }
 }
@@ -252,7 +406,7 @@ fn core_display() -> Option<&'static CoreDisplayLib> {
 
 struct BuiltinTransport {
     cg_id: u32,
-    gamma: Option<Gamma>,
+    dimmed: bool,
 }
 
 impl Transport for BuiltinTransport {
@@ -279,15 +433,15 @@ impl Transport for BuiltinTransport {
     }
 
     fn software_level(&mut self, level: u8) -> bool {
-        let g = self.gamma.get_or_insert_with(|| Gamma::capture(self.cg_id));
-        g.apply(self.cg_id, level)
+        self.dimmed = true;
+        gamma::set_level(self.cg_id, level)
     }
 }
 
 impl Drop for BuiltinTransport {
     fn drop(&mut self) {
-        if let Some(g) = &self.gamma {
-            g.restore(self.cg_id);
+        if self.dimmed {
+            gamma::set_level(self.cg_id, 100);
         }
     }
 }
@@ -523,6 +677,34 @@ impl Backend for MacBackend {
         "macos"
     }
 
+    fn supports_picture(&self) -> bool {
+        true
+    }
+
+    fn set_picture(&self, info: &DisplayInfo, picture: &SoftPicture) -> bool {
+        match info.extra.get("cg_id").and_then(|id| id.parse().ok()) {
+            Some(id) => gamma::set_picture(id, picture.gains(), picture.exponent()),
+            None => false,
+        }
+    }
+
+    fn ambient_lux(&self) -> Option<f32> {
+        // with the lid closed the sensor is covered and reads 0
+        active_builtin()?;
+        ambient::lux()
+    }
+
+    fn builtin_brightness(&self) -> Option<f32> {
+        let id = active_builtin()?;
+        let lib = core_display()?;
+        Some(unsafe { (lib.get)(id) } as f32)
+    }
+
+    fn screens_idle(&self) -> Option<bool> {
+        let asleep = unsafe { CGDisplayIsAsleep(CGMainDisplayID()) } != 0;
+        Some(asleep || session_locked())
+    }
+
     fn list_displays(&self) -> Vec<DisplayInfo> {
         let ids = Self::online_displays();
         let found = Self::scan_proxies();
@@ -589,7 +771,7 @@ impl Backend for MacBackend {
     fn open_session(&self, info: &DisplayInfo) -> Option<Box<dyn Session>> {
         let cg_id: u32 = info.extra.get("cg_id")?.parse().ok()?;
         if info.builtin {
-            return Some(Box::new(GuardedSession::new(BuiltinTransport { cg_id, gamma: None }, IO_TIMEOUT, 0)));
+            return Some(Box::new(GuardedSession::new(BuiltinTransport { cg_id, dimmed: false }, IO_TIMEOUT, 0)));
         }
         // 1) Apple Silicon: IOAVService
         if let Some(av) = info.extra.get("av") {
@@ -602,7 +784,7 @@ impl Backend for MacBackend {
             };
             if let Some(handle) = self.proxies.lock().unwrap().get(&key).cloned() {
                 return Some(Box::new(GuardedSession::new(
-                    AvTransport { handle, gamma: None, cg_id },
+                    AvTransport { handle, dimmed: false, cg_id },
                     IO_TIMEOUT,
                     1,
                 )));

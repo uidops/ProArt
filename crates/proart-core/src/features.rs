@@ -260,9 +260,7 @@ const PRESET_MODES: &[&str] = &[
 const ONOFF: &[&str] = &["Off", "On"];
 const OFF_ON: &[Choice] = &[c("Off", 0), c("On", 1)];
 
-fn blue_levels() -> Vec<Choice> {
-    vec![c("Level 0", 0), c("Level 1", 1), c("Level 2", 2), c("Level 3", 3), c("Level 4", 4)]
-}
+const BLUE_LEVELS: &[&str] = &["Level 0", "Level 1", "Level 2", "Level 3", "Level 4"];
 
 // ------------------------------------------------------------------- the list --
 
@@ -305,10 +303,9 @@ fn build() -> Vec<Feature> {
             ..documented_choice("preset_calibrated", Preset, "ProArt Preset (calibrated)", 0xE3, PROART_PRESETS)
         },
         // -- Blue Light Filter -----------------------------------------------------
-        Feature {
-            note: "0xE6 reads on the PA278QV but its writes had no effect in the modes tried",
-            ..documented_choice("blue_light", Blue, "Blue Light Filter", 0xE6, &blue_levels())
-        },
+        // ASUS's tooling uses 0xE6 (levels 0-4), but the PA278QV ignores writes
+        // there, so the register and its values are learned per monitor.
+        learn_choice("blue_light", Blue, "Blue Light Filter", BLUE_LEVELS),
         // -- ProArt Palette --------------------------------------------------------
         Feature { verified: true, ..mccs_slider("brightness", Palette, "Brightness", 0x10) },
         Feature { verified: true, ..mccs_slider("contrast", Palette, "Contrast", 0x12) },
@@ -562,7 +559,7 @@ mod tests {
                   "Darkroom Mode", "Rapid Rendering Mode"] {
             assert!(names.contains(n), "{n}");
         }
-        assert_eq!(get("blue_light").unwrap().choices.len(), 5);
+        assert_eq!(get("blue_light").unwrap().options.len(), 5);
     }
 
     #[test]

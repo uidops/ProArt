@@ -11,9 +11,16 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::automation::Automation;
+use crate::tint::SoftPicture;
+
 pub const CONFIG_VERSION: u32 = 1;
 
 pub fn config_dir() -> PathBuf {
+    // unit tests must never write the user's settings
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("proart-test-{}", std::process::id()));
+    }
     if let Some(dir) = std::env::var_os("PROART_CONFIG_DIR") {
         return PathBuf::from(dir);
     }
@@ -85,6 +92,8 @@ pub struct DisplayPrefs {
     pub feature_map: BTreeMap<String, Learned>,
     /// ProArt features this display does not expose (a learn run found nothing).
     pub unsupported_features: Vec<String>,
+    /// Warmth, extra dimming and gamma applied through the colour tables.
+    pub software: SoftPicture,
 }
 
 impl Default for DisplayPrefs {
@@ -96,6 +105,7 @@ impl Default for DisplayPrefs {
             value_cache: BTreeMap::new(),
             feature_map: BTreeMap::new(),
             unsupported_features: Vec::new(),
+            software: SoftPicture::default(),
         }
     }
 }
@@ -158,6 +168,8 @@ pub struct Preset {
     pub values: BTreeMap<String, BTreeMap<String, u16>>,
     /// dontChange | turnOn | turnOff
     pub power: String,
+    /// display key -> software picture (warmth, dimming, gamma)
+    pub software: BTreeMap<String, SoftPicture>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -168,6 +180,7 @@ pub struct Settings {
     pub global: GlobalSettings,
     pub displays: BTreeMap<String, DisplayPrefs>,
     pub presets: Vec<Preset>,
+    pub automation: Automation,
 }
 
 impl Default for Settings {
@@ -178,6 +191,7 @@ impl Default for Settings {
             global: GlobalSettings::default(),
             displays: BTreeMap::new(),
             presets: Vec::new(),
+            automation: Automation::default(),
         }
     }
 }

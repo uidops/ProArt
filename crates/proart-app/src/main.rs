@@ -4,15 +4,26 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod actions;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod app_presets;
 mod controls;
+mod icons;
 mod learn;
+#[cfg(target_os = "macos")]
+mod mac;
 mod main_view;
+#[cfg(target_os = "macos")]
+mod media_keys;
+#[cfg(target_os = "macos")]
+mod osd_view;
 mod panel_view;
 mod state;
 mod text_field;
 mod theme;
 mod tray;
 mod ui;
+#[cfg(target_os = "macos")]
+mod watch;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -122,7 +133,7 @@ fn close_panel(cx: &mut App) -> bool {
 fn open_panel(cx: &mut App, origin: Option<gpui::Point<gpui::Pixels>>) {
     let rows = {
         let sh = cx.global::<Shared>();
-        sh.mgr.displays().first().map(|st| panel_view::quick_features(&sh.mgr, st).len()).unwrap_or(0)
+        sh.mgr.displays().first().map(|st| panel_view::row_count(&sh.mgr, st)).unwrap_or(0)
     };
     let origin = origin.unwrap_or_else(|| {
         // no tray position (--panel): top right, under the menu bar
@@ -148,7 +159,7 @@ fn handle_tray(cx: &mut App, msg: TrayMsg) {
             let (x, y, w, h) = (x as f32 / scale, y as f32 / scale, w as f32 / scale, h as f32 / scale);
             let rows = {
                 let sh = cx.global::<Shared>();
-                sh.mgr.displays().first().map(|st| panel_view::quick_features(&sh.mgr, st).len()).unwrap_or(0)
+                sh.mgr.displays().first().map(|st| panel_view::row_count(&sh.mgr, st)).unwrap_or(0)
             };
             let origin = panel_view::origin_below(cx, x + w / 2.0, y, y + h, rows);
             open_panel(cx, Some(origin));
@@ -169,7 +180,7 @@ fn main() {
     mgr.start();
 
     let mgr_run = mgr.clone();
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(icons::Assets).run(move |cx: &mut App| {
         text_field::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| quit_to_tray(cx));
@@ -193,6 +204,8 @@ fn main() {
         if args.panel {
             open_panel(cx, None);
         }
+        #[cfg(target_os = "macos")]
+        watch::start(cx);
 
         if let Some((handle, rx)) = tray {
             // tray events arrive on the main thread through a channel: poll it

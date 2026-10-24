@@ -8,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::ddc::VcpReply;
+use crate::tint::SoftPicture;
 
 pub mod fake;
 #[cfg(target_os = "linux")]
@@ -74,6 +75,28 @@ pub trait Backend: Send + Sync {
     /// Cheap fingerprint of the connected displays, polled for hotplug.
     fn poll_signature(&self) -> String {
         self.list_displays().iter().map(|d| d.key.as_str()).collect::<Vec<_>>().join("|")
+    }
+    /// Can [`set_picture`](Backend::set_picture) change the picture on this OS?
+    fn supports_picture(&self) -> bool {
+        false
+    }
+    /// Apply warmth, dimming and gamma through the display's colour tables,
+    /// independent of DDC/CI. The default picture restores it.
+    fn set_picture(&self, _info: &DisplayInfo, _picture: &SoftPicture) -> bool {
+        false
+    }
+    /// Light level from the computer's ambient light sensor, when it can see
+    /// the room (None with the lid closed or without a sensor).
+    fn ambient_lux(&self) -> Option<f32> {
+        None
+    }
+    /// Brightness (0-1) of the built-in display while it is on.
+    fn builtin_brightness(&self) -> Option<f32> {
+        None
+    }
+    /// True while the computer's screens sleep or the session is locked.
+    fn screens_idle(&self) -> Option<bool> {
+        None
     }
 }
 

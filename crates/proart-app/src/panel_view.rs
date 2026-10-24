@@ -12,7 +12,7 @@ use proart_core::features::{self, Feature};
 use proart_core::manager::{DisplayState, Status};
 
 use crate::actions;
-use crate::controls::{confirm, feature_row, ConfirmFn, Confirmation, Ctl};
+use crate::controls::{confirm, feature_row, software_blue_row, ConfirmFn, Confirmation, Ctl};
 use crate::main_view::toast_stack;
 use crate::state::Shared;
 use crate::theme::Theme;
@@ -85,6 +85,12 @@ impl PanelView {
     }
 }
 
+/// Rows the panel shows for a display: the quick controls plus the software
+/// blue-light filter where the OS supports it.
+pub fn row_count(mgr: &proart_core::manager::Manager, st: &Arc<DisplayState>) -> usize {
+    quick_features(mgr, st).len() + usize::from(mgr.picture_supported())
+}
+
 /// Visible quick controls for a display, in registry order.
 pub fn quick_features(mgr: &proart_core::manager::Manager, st: &Arc<DisplayState>) -> Vec<&'static Feature> {
     let wanted = mgr.with_settings(|s| s.ui.quick_features.clone());
@@ -106,7 +112,7 @@ impl Render for PanelView {
         let features = st.as_ref().map(|s| quick_features(&mgr, s)).unwrap_or_default();
 
         // fit the window to its rows once the probe has told us how many there are
-        let h = height_for(features.len());
+        let h = height_for(st.as_ref().map(|s| row_count(&mgr, s)).unwrap_or(0));
         if (h - self.last_h).abs() > 0.5 {
             self.last_h = h;
             window.resize(size(px(PANEL_W), px(h)));
@@ -123,7 +129,13 @@ impl Render for PanelView {
         let probing = st.as_ref().is_some_and(|s| bus.is_probing(s.key()));
         let label = st.as_ref().map(|s| mgr.label(s)).unwrap_or_else(|| "No display detected".into());
         let rows: Vec<AnyElement> = match &st {
-            Some(st) => features.iter().map(|f| feature_row(&ctl, st, f)).collect(),
+            Some(st) => {
+                let mut rows: Vec<AnyElement> = features.iter().map(|f| feature_row(&ctl, st, f)).collect();
+                if mgr.picture_supported() {
+                    rows.push(software_blue_row(&ctl, st, ""));
+                }
+                rows
+            }
             None => Vec::new(),
         };
 
@@ -268,7 +280,7 @@ mod tests {
     use proart_core::{Manager, Settings};
 
     use super::*;
-    use crate::main_view::tests::Shared2;
+    use crate::main_view::tests::{isolate_settings, Shared2};
     use crate::state::Bus;
 
     fn center(b: Bounds<Pixels>) -> gpui::Point<Pixels> {
@@ -277,6 +289,7 @@ mod tests {
 
     #[gpui::test]
     fn turn_off_asks_inside_the_panel_then_powers_off(cx: &mut TestAppContext) {
+        isolate_settings();
         let fake = Arc::new(FakeBackend::sample());
         fake.set_register(0xD6, 1, 4);
         let mgr = Manager::new(Box::new(Shared2(fake.clone())), Settings::default(), Arc::new(|_| {}));

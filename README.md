@@ -82,9 +82,9 @@ picture modes (a PA278QV in sRGB mode ignores colour-temperature writes).
 ### Learning ASUS-specific items
 
 ASUS publishes no opcode table. Where ASUS's own tooling documents an opcode and
-its values (Blue Light, Gamma, Trace Free, Input Range, ASCR, ...) they are built
-in and used only if the monitor answers them. For the rest (e.g. ProArt Preset on
-PA278QV-class monitors) ProArt can **learn** them: *Learn...* in the app (or
+its values (Gamma, Trace Free, Input Range, ASCR, ...) they are built
+in and used only if the monitor answers them. For the rest (e.g. ProArt Preset and
+Blue Light Filter on PA278QV-class monitors) ProArt can **learn** them: *Learn...* in the app (or
 `proart learn <feature>`) asks you to pick each value in the monitor's own menu,
 scans the monitor's registers after each step and keeps the register that tracks
 the change. Nothing is written to an opcode that is neither documented nor
@@ -92,6 +92,42 @@ learned. See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 If you used the Python *ProArt Bar*, its learned mappings and presets are
 imported on first run.
+
+### On this Mac (software picture)
+
+Some things a monitor cannot do over DDC/CI the Mac can do through the display's
+colour tables, on any monitor, while ProArt runs (macOS restores the picture
+when it quits; they do not show in screenshots):
+
+* **Software Blue Light** (Level 0 - 4) and a **Warmth** slider (6500 K - 2700 K),
+  on the Blue Light Filter page and in the menu-bar panel;
+* **Extra dimming** below the monitor's minimum brightness and a **Gamma** curve
+  (1.8 - 2.6), on the ProArt Palette page.
+
+Presets save and restore these with the monitor's own settings. Colour tables
+are per channel, so saturation, hue or greyscale cannot be done this way.
+
+### Automation
+
+The Automation page (macOS):
+
+* **Blue light schedule**: warm every monitor between two times, fading in and out;
+  a warmer manual setting still wins.
+* **Presets at set times**: apply a preset every day at a time; after sleep only
+  the latest missed one is applied.
+* **Presets per app**: apply a preset while an app is in front (e.g. sRGB for
+  Lightroom) and restore the previous settings when you switch away. Input
+  Select is never restored behind your back.
+* **Keyboard**: the Mac's brightness keys control the monitor under the pointer,
+  volume and mute keys control its speakers while sound plays through HDMI or
+  DisplayPort, with an on-screen indicator. Needs Privacy & Security >
+  Accessibility; the ad-hoc signature changes with every build, so after an
+  update remove ProArt from that list and add it again.
+* **Ambient light**: monitor brightness from the Mac's light sensor (or from the
+  built-in display's brightness), between a darkest and a brightest level; your
+  own changes stay as an offset. Not available with the lid closed.
+* **Sleep and wake**: monitors go to standby when the Mac sleeps or locks and
+  come back when it wakes.
 
 ## Layout
 

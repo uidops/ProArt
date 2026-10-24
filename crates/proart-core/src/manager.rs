@@ -16,6 +16,8 @@ use crate::config::{Learned, Preset, Settings};
 use crate::ddc::{MUTE_OFF, MUTE_ON, POWER_OFF, POWER_ON, VCP_MUTE, VCP_POWER_MODE, VCP_TABLE_VERSION};
 use crate::features::{self, Feature, Gen, Kind};
 use crate::learn::Scan;
+use crate::automation::{self, AmbientSource};
+use crate::tint::SoftPicture;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(2500);
 /// Don't read back a control the user touched this recently.
@@ -68,6 +70,18 @@ struct Data {
     last_write: HashMap<&'static str, Instant>,
     read_failures: u32,
     retry_after: Option<Instant>,
+    /// Software picture last sent to the colour tables.
+    applied_picture: Option<SoftPicture>,
+    /// The user's correction on top of ambient brightness, and the last
+    /// value ambient light set.
+    ambient_offset: i16,
+    ambient_last: Option<u16>,
+}
+
+/// The display has replied for this feature at least once (`max` is only
+/// recorded from a reply).
+fn answered(d: &Data, f: &Feature) -> bool {
+    d.max.contains_key(f.id)
 }
 
 pub struct DisplayState {
@@ -120,6 +134,19 @@ pub struct Manager {
     live_features: Mutex<Vec<&'static Feature>>,
     pending: Mutex<PendingMap>,
     pending_cv: Condvar,
+    /// Last ambient-light reading and the brightness it asked for.
+    ambient: Mutex<Option<AmbientReading>>,
+    /// Minutes after midnight to use instead of the clock (tests).
+    clock: Mutex<Option<f32>>,
+}
+
+/// What ambient light last asked for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AmbientReading {
+    pub source: AmbientSource,
+    /// Lux from the sensor, or built-in brightness 0-1.
+    pub input: f32,
+    pub target: u8,
 }
 
 impl Manager {
@@ -134,12 +161,15 @@ impl Manager {
             live_features: Mutex::new(Vec::new()),
             pending: Mutex::new(HashMap::new()),
             pending_cv: Condvar::new(),
+            ambient: Mutex::new(None),
+            clock: Mutex::new(None),
         })
     }
 
     /// Discover displays and start the hotplug, write and live-value threads.
     pub fn start(self: &Arc<Self>) {
         self.refresh();
+        self.apply_pictures();
         let m = self.clone();
         thread::Builder::new()
             .name("hotplug".into())
@@ -152,6 +182,7 @@ impl Manager {
                         signature = now;
                         m.refresh();
                     }
+                    m.apply_pictures();
                 }
             })
             .expect("spawn hotplug thread");
@@ -159,6 +190,8 @@ impl Manager {
         thread::Builder::new().name("writes".into()).spawn(move || m.write_loop()).expect("spawn write thread");
         let m = self.clone();
         thread::Builder::new().name("live".into()).spawn(move || m.live_loop()).expect("spawn live thread");
+        let m = self.clone();
+        thread::Builder::new().name("automation".into()).spawn(move || m.automation_loop()).expect("spawn automation thread");
     }
 
     pub fn stop(&self) {
@@ -320,10 +353,13 @@ impl Manager {
         let reply = self.with_session(st, |s| s.get_vcp(vcp)).flatten();
         let learned = self.learned_entry(st, f).is_some();
         let Some(r) = reply else {
-            if !learned {
-                st.data.lock().unwrap().status.insert(f.id, Status::Unsupported);
+            let mut d = st.data.lock().unwrap();
+            // a missed reply (busy bus, a write in flight, the monitor waking)
+            // does not hide a feature that has answered before
+            if !learned && !answered(&d, f) {
+                d.status.insert(f.id, Status::Unsupported);
             }
-            return st.value(f.id);
+            return d.values.get(f.id).copied();
         };
         let (changed, stale) = {
             let mut d = st.data.lock().unwrap();
@@ -384,7 +420,7 @@ impl Manager {
                 d.max.insert(f.id, r.max);
                 d.values.insert(f.id, r.current);
             }
-            None if !learned => {
+            None if !learned && !answered(&d, f) => {
                 d.status.insert(f.id, Status::Unsupported);
             }
             None => {}
@@ -492,10 +528,18 @@ impl Manager {
                 }
             }
         }
+        let ambient = self.with_settings(|s| s.automation.ambient.enabled);
         for (target, feature) in targets {
             {
                 let mut d = target.data.lock().unwrap();
                 d.last_write.insert(feature.id, Instant::now());
+                // a manual change while brightness follows the light becomes an offset
+                if ambient && feature.id == "brightness" {
+                    if let Some(r) = *self.ambient.lock().unwrap() {
+                        d.ambient_offset = (value as i16 - r.target as i16).clamp(-100, 100);
+                        d.ambient_last = Some(value);
+                    }
+                }
             }
             if target.set_value(feature.id, value) {
                 self.emit_value(&target, feature);
@@ -522,6 +566,171 @@ impl Manager {
             };
             for (state, feature, value) in batch {
                 self.write(&state, feature, Some(value));
+            }
+        }
+    }
+
+    // -- software picture ------------------------------------------------------------
+    pub fn picture_supported(&self) -> bool {
+        self.backend.supports_picture()
+    }
+
+    /// Warmth, extra dimming and gamma the user set for a display.
+    pub fn software_picture(&self, st: &DisplayState) -> SoftPicture {
+        self.with_settings(|s| s.displays.get(st.key()).map(|d| d.software).unwrap_or_default())
+    }
+
+    /// Set, remember and apply a display's software picture.
+    pub fn set_software_picture(&self, st: &DisplayState, picture: SoftPicture) -> bool {
+        let ok = self.preview_software_picture(st, picture);
+        self.save_settings();
+        ok
+    }
+
+    /// Apply a software picture without writing the settings file (while a
+    /// slider is dragged; `set_software_picture` on release).
+    pub fn preview_software_picture(&self, st: &DisplayState, picture: SoftPicture) -> bool {
+        let picture = picture.clamped();
+        self.with_settings(|s| s.display_prefs(st.key()).software = picture);
+        self.apply_picture(st, true)
+    }
+
+    /// Minutes after local midnight.
+    pub fn now_minutes(&self) -> f32 {
+        if let Some(m) = *self.clock.lock().unwrap() {
+            return m;
+        }
+        use chrono::Timelike;
+        let now = chrono::Local::now();
+        (now.hour() * 60 + now.minute()) as f32 + now.second() as f32 / 60.0
+    }
+
+    /// Colour temperature the blue-light schedule asks for right now.
+    pub fn scheduled_kelvin(&self) -> Option<u32> {
+        let schedule = self.with_settings(|s| s.automation.blue_schedule.clone());
+        automation::schedule_kelvin(&schedule, self.now_minutes())
+    }
+
+    /// What goes on screen: the user's picture, warmed further while the
+    /// blue-light schedule runs.
+    pub fn effective_picture(&self, st: &DisplayState) -> SoftPicture {
+        let mut p = self.software_picture(st);
+        if let Some(k) = self.scheduled_kelvin() {
+            p.kelvin = p.kelvin.min(k);
+        }
+        p
+    }
+
+    /// Send the effective picture to the colour tables. Neutral pictures are
+    /// only sent to undo an earlier change, so displays nobody adjusted keep
+    /// their tables untouched.
+    fn apply_picture(&self, st: &DisplayState, force: bool) -> bool {
+        let p = self.effective_picture(st);
+        let last = st.data.lock().unwrap().applied_picture;
+        if !force && p.is_neutral() && last.is_none_or(|l| l.is_neutral()) {
+            return true;
+        }
+        let ok = self.backend.set_picture(&st.info, &p);
+        st.data.lock().unwrap().applied_picture = Some(p);
+        ok
+    }
+
+    /// The OS resets colour tables on wake, display changes and profile
+    /// switches, and the schedule fades over time, so pictures are applied
+    /// again on every hotplug poll.
+    fn apply_pictures(&self) {
+        for st in self.displays() {
+            self.apply_picture(&st, false);
+        }
+    }
+
+    // -- automation --------------------------------------------------------------------
+    /// What ambient light last asked for (None while off or unavailable).
+    pub fn ambient_reading(&self) -> Option<AmbientReading> {
+        *self.ambient.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_clock(&self, minutes: f32) {
+        *self.clock.lock().unwrap() = Some(minutes);
+    }
+
+    fn automation_loop(self: Arc<Self>) {
+        let mut last_minute = self.now_minutes();
+        let mut idle: Option<bool> = None;
+        let mut tick = 0u64;
+        while !self.stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(1));
+            tick += 1;
+            let now = self.now_minutes();
+            self.run_timed_presets(last_minute, now);
+            last_minute = now;
+            idle = self.power_tick(idle);
+            if tick % 2 == 0 {
+                self.ambient_tick();
+            }
+        }
+    }
+
+    /// Apply the timed preset whose time passed between `last` and `now`.
+    fn run_timed_presets(self: &Arc<Self>, last: f32, now: f32) -> Option<String> {
+        let (entries, presets) = self.with_settings(|s| (s.automation.timed_presets.clone(), s.presets.clone()));
+        let due = automation::due_preset(&entries, last, now)?;
+        let preset = presets.into_iter().find(|p| p.id == due.preset)?;
+        let (m, p) = (self.clone(), preset.clone());
+        thread::Builder::new().name("timed-preset".into()).spawn(move || m.apply_preset(&p)).ok()?;
+        Some(preset.id)
+    }
+
+    /// Turn monitors off when the computer's screens sleep or it locks, and
+    /// on again when it wakes. Returns the new idle state.
+    fn power_tick(&self, was: Option<bool>) -> Option<bool> {
+        let now = self.backend.screens_idle()?;
+        let p = self.with_settings(|s| s.automation.power.clone());
+        if was == Some(now) || was.is_none() {
+            return Some(now);
+        }
+        for st in self.displays().into_iter().filter(|d| !d.info.builtin) {
+            if now && p.off_on_sleep {
+                // DPM off (4), not hard off: the monitor still wakes on signal
+                self.with_session(&st, |s| s.set_vcp(VCP_POWER_MODE, POWER_OFF.min(4)));
+            } else if !now && p.on_on_wake {
+                self.power(&st, true);
+            }
+        }
+        Some(now)
+    }
+
+    /// Follow the room's light (or the built-in display) with monitor brightness.
+    fn ambient_tick(&self) {
+        let a = self.with_settings(|s| s.automation.ambient.clone());
+        let reading = if !a.enabled {
+            None
+        } else {
+            match a.source {
+                AmbientSource::Sensor => self.backend.ambient_lux().map(|lux| (lux, automation::ambient_brightness(lux, a.min, a.max))),
+                AmbientSource::Builtin => self.backend.builtin_brightness().map(|b| (b, automation::follow_brightness(b, a.min, a.max))),
+            }
+            .map(|(input, target)| AmbientReading { source: a.source, input, target })
+        };
+        *self.ambient.lock().unwrap() = reading;
+        let Some(r) = reading else { return };
+        let Some(f) = features::get("brightness") else { return };
+        for st in self.displays().into_iter().filter(|d| !d.info.builtin) {
+            if !self.visible(&st, f) || st.recently_written(f.id) {
+                continue;
+            }
+            let (offset, last) = {
+                let d = st.data.lock().unwrap();
+                (d.ambient_offset, d.ambient_last)
+            };
+            let value = (r.target as i16 + offset).clamp(0, 100) as u16;
+            // small changes are noise from the sensor
+            if last.is_some_and(|l| l.abs_diff(value) < 2) {
+                continue;
+            }
+            if self.write(&st, f, Some(value)) {
+                st.data.lock().unwrap().ambient_last = Some(value);
             }
         }
     }
@@ -711,12 +920,20 @@ impl Manager {
             if !values.is_empty() {
                 preset.values.insert(st.key().to_string(), values);
             }
+            if self.picture_supported() {
+                preset.software.insert(st.key().to_string(), self.software_picture(&st));
+            }
         }
         preset
     }
 
     pub fn apply_preset(&self, preset: &Preset) {
         let displays = self.displays();
+        for (key, picture) in &preset.software {
+            if let Some(st) = displays.iter().find(|d| d.key() == key).or_else(|| (displays.len() == 1).then(|| &displays[0])) {
+                self.set_software_picture(st, *picture);
+            }
+        }
         for (key, values) in &preset.values {
             let st = displays.iter().find(|d| d.key() == key).cloned().or_else(|| (displays.len() == 1).then(|| displays[0].clone()));
             let Some(st) = st else { continue };
@@ -762,6 +979,9 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automation::{Ambient, BlueSchedule, PowerAutomation, TimedPreset};
+    use crate::config::Preset;
+    use crate::tint;
     use crate::backend::fake::FakeBackend;
     use std::sync::Arc as StdArc;
 
@@ -776,6 +996,10 @@ mod tests {
         fn name(&self) -> &'static str { "fake" }
         fn list_displays(&self) -> Vec<DisplayInfo> { self.0.list_displays() }
         fn open_session(&self, i: &DisplayInfo) -> Option<Box<dyn Session>> { self.0.open_session(i) }
+        fn supports_picture(&self) -> bool { self.0.supports_picture() }
+        fn set_picture(&self, i: &DisplayInfo, p: &SoftPicture) -> bool { self.0.set_picture(i, p) }
+        fn ambient_lux(&self) -> Option<f32> { self.0.ambient_lux() }
+        fn screens_idle(&self) -> Option<bool> { self.0.screens_idle() }
     }
 
     fn rig() -> Rig {
@@ -819,14 +1043,14 @@ mod tests {
     #[test]
     fn documented_vendor_features_work_and_hide_when_silent() {
         let r = rig();
-        r.fake.set_register(0xE6, 0, 255);
+        r.fake.set_register(0xE1, 0, 1);
         let st = r.mgr.displays()[0].clone();
         r.mgr.probe(&st);
-        let blue = feat("blue_light");
-        assert_eq!(r.mgr.status(&st, blue), Status::Ok);
-        assert!(r.mgr.write(&st, blue, Some(3)));
-        assert_eq!(r.fake.register(0xE6).unwrap().0, 3);
-        assert!(!r.mgr.write(&st, blue, Some(9)), "not a level");
+        let ascr = feat("ascr");
+        assert_eq!(r.mgr.status(&st, ascr), Status::Ok);
+        assert!(r.mgr.write(&st, ascr, Some(1)));
+        assert_eq!(r.fake.register(0xE1).unwrap().0, 1);
+        assert!(!r.mgr.write(&st, ascr, Some(9)), "not a value of the table");
         assert!(!r.mgr.visible(&st, feat("trace_free")), "monitor never answered 0xE0");
         assert!(r.mgr.visible(&st, feat("brightness")));
     }
@@ -868,6 +1092,169 @@ mod tests {
         assert_eq!(r.mgr.choice_label(&st, preset, 13), "sRGB Mode");
         assert!(r.mgr.write(&st, preset, Some(24)));
         assert_eq!(r.fake.register(0xDC).unwrap().0, 24);
+    }
+
+    #[test]
+    fn blue_light_is_learned_not_built_in() {
+        let r = rig();
+        r.fake.set_register(0xE6, 1, 255);
+        let st = r.mgr.displays()[0].clone();
+        r.mgr.probe(&st);
+        let blue = feat("blue_light");
+        assert_eq!(r.mgr.status(&st, blue), Status::Unlearned, "0xE6 is not used just because it answers");
+        assert!(!r.mgr.write(&st, blue, Some(3)), "nothing is written before learning");
+        assert_eq!(r.fake.register(0xE6).unwrap().0, 1);
+        r.fake.set_register(0xF0, 0, 4);
+        let values = (0..5u16).map(|i| (format!("Level {i}"), i)).collect();
+        r.mgr.save_learned(&st, blue, 0xF0, values);
+        assert_eq!(r.mgr.status(&st, blue), Status::Ok);
+        assert!(r.mgr.write(&st, blue, Some(3)));
+        assert_eq!(r.fake.register(0xF0).unwrap().0, 3);
+        assert_eq!(r.mgr.choice_label(&st, blue, 3), "Level 3");
+    }
+
+    fn picture(r: &Rig, st: &DisplayState) -> Option<SoftPicture> {
+        r.fake.pictures.lock().unwrap().get(st.key()).copied()
+    }
+
+    #[test]
+    fn the_software_picture_is_applied_and_remembered() {
+        let r = rig();
+        let st = r.mgr.displays()[0].clone();
+        assert!(r.mgr.picture_supported());
+        r.mgr.set_clock(12.0 * 60.0);
+        r.mgr.apply_pictures();
+        assert_eq!(picture(&r, &st), None, "untouched displays keep their tables");
+        let warm = SoftPicture { kelvin: tint::level_kelvin(3), dim: 30, gamma: 2.4 };
+        assert!(r.mgr.set_software_picture(&st, warm));
+        assert_eq!(r.mgr.software_picture(&st), warm);
+        assert_eq!(picture(&r, &st), Some(warm));
+        // the OS reset the tables: the next poll puts the picture back
+        r.fake.pictures.lock().unwrap().clear();
+        r.mgr.apply_pictures();
+        assert_eq!(picture(&r, &st), Some(warm));
+        assert!(r.mgr.set_software_picture(&st, SoftPicture { dim: 250, ..warm }));
+        assert_eq!(r.mgr.software_picture(&st).dim, tint::MAX_DIM, "clamped");
+        assert!(r.mgr.set_software_picture(&st, SoftPicture::default()));
+        assert_eq!(picture(&r, &st), Some(SoftPicture::default()), "neutral restores the picture");
+    }
+
+    #[test]
+    fn the_blue_light_schedule_warms_on_top_of_the_users_picture() {
+        let r = rig();
+        let st = r.mgr.displays()[0].clone();
+        r.mgr.with_settings(|s| {
+            s.automation.blue_schedule = BlueSchedule { enabled: true, start: 21 * 60, end: 7 * 60, kelvin: 3400, fade_min: 0 };
+        });
+        r.mgr.set_clock(23.0 * 60.0);
+        r.mgr.apply_pictures();
+        assert_eq!(picture(&r, &st).unwrap().kelvin, 3400, "the schedule applies without a manual setting");
+        r.mgr.with_settings(|s| s.display_prefs(st.key()).software.kelvin = 3000);
+        assert_eq!(r.mgr.effective_picture(&st).kelvin, 3000, "a warmer manual setting wins");
+        r.mgr.with_settings(|s| s.display_prefs(st.key()).software.kelvin = 6500);
+        r.mgr.set_clock(12.0 * 60.0);
+        r.mgr.apply_pictures();
+        assert_eq!(picture(&r, &st), Some(SoftPicture::default()), "the day undoes the schedule");
+    }
+
+    #[test]
+    fn a_timed_preset_runs_when_its_time_passes() {
+        let r = rig();
+        let st = r.mgr.displays()[0].clone();
+        r.mgr.with_settings(|s| {
+            s.presets.push(Preset { id: "eve".into(), values: [(st.key().to_string(), [("brightness".to_string(), 20u16)].into())].into(), ..Preset::default() });
+            s.automation.timed_presets.push(TimedPreset { id: "t1".into(), enabled: true, at: 20 * 60, preset: "eve".into() });
+        });
+        assert_eq!(r.mgr.run_timed_presets(19.0 * 60.0, 19.5 * 60.0), None);
+        assert_eq!(r.mgr.run_timed_presets(19.99 * 60.0, 20.0 * 60.0 + 0.5).as_deref(), Some("eve"));
+        for _ in 0..40 {
+            if r.fake.register(0x10).unwrap().0 == 20 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(r.fake.register(0x10).unwrap().0, 20);
+    }
+
+    #[test]
+    fn monitors_sleep_and_wake_with_the_computer() {
+        let r = rig();
+        r.fake.set_register(0xD6, 1, 5);
+        r.mgr.with_settings(|s| s.automation.power = PowerAutomation { off_on_sleep: true, on_on_wake: true });
+        *r.fake.idle.lock().unwrap() = Some(false);
+        let state = r.mgr.power_tick(None);
+        assert_eq!(r.fake.register(0xD6).unwrap().0, 1, "nothing happens on the first look");
+        *r.fake.idle.lock().unwrap() = Some(true);
+        let state = r.mgr.power_tick(state);
+        assert_eq!(r.fake.register(0xD6).unwrap().0, 4, "DPM off, so the signal can wake it");
+        *r.fake.idle.lock().unwrap() = Some(false);
+        r.mgr.power_tick(state);
+        assert_eq!(r.fake.register(0xD6).unwrap().0, 1, "on again");
+    }
+
+    #[test]
+    fn brightness_follows_ambient_light_and_keeps_the_users_offset() {
+        let r = rig();
+        let st = r.mgr.displays()[0].clone();
+        let b = feat("brightness");
+        r.mgr.probe(&st);
+        r.mgr.with_settings(|s| s.automation.ambient = Ambient { enabled: true, source: AmbientSource::Sensor, min: 10, max: 90 });
+        *r.fake.lux.lock().unwrap() = Some(0.0);
+        r.mgr.ambient_tick();
+        assert_eq!(r.fake.register(0x10).unwrap().0, 10, "dark room");
+        assert_eq!(r.mgr.ambient_reading().unwrap().target, 10);
+        // the user brightens it by 15: that sticks as an offset
+        r.mgr.queue_write(&st, b, 25);
+        r.mgr.write(&st, b, Some(25));
+        st.data.lock().unwrap().last_write.clear();
+        *r.fake.lux.lock().unwrap() = Some(1000.0);
+        r.mgr.ambient_tick();
+        assert_eq!(r.fake.register(0x10).unwrap().0, 100, "bright room plus the offset, capped");
+        *r.fake.lux.lock().unwrap() = None;
+        r.mgr.ambient_tick();
+        assert_eq!(r.mgr.ambient_reading(), None, "no sensor (lid closed): nothing changes");
+        assert_eq!(r.fake.register(0x10).unwrap().0, 100);
+    }
+
+    #[test]
+    fn presets_carry_the_software_picture() {
+        let r = rig();
+        let st = r.mgr.displays()[0].clone();
+        let warm = SoftPicture { kelvin: 4000, ..SoftPicture::default() };
+        r.mgr.set_software_picture(&st, warm);
+        let preset = r.mgr.capture_preset("night", "moon");
+        assert_eq!(preset.software[st.key()], warm);
+        r.mgr.set_software_picture(&st, SoftPicture::default());
+        r.mgr.apply_preset(&preset);
+        assert_eq!(r.mgr.software_picture(&st), warm);
+    }
+
+    #[test]
+    fn a_missed_reply_keeps_a_feature_that_answered_before() {
+        let r = rig();
+        let st = r.mgr.displays()[0].clone();
+        let b = feat("brightness");
+        assert_eq!(r.mgr.read(&st, b), Some(86));
+        // the monitor stops answering for a moment (busy bus, waking up)
+        let saved = r.fake.store.lock().unwrap().remove(&0x10).unwrap();
+        assert_eq!(r.mgr.read(&st, b), Some(86), "last known value");
+        assert_eq!(r.mgr.status(&st, b), Status::Ok);
+        assert!(r.mgr.visible(&st, b), "brightness stays on screen");
+        r.mgr.probe(&st);
+        assert!(r.mgr.visible(&st, b), "a re-probe does not hide it either");
+        r.fake.store.lock().unwrap().insert(0x10, (saved.0, saved.1));
+        assert_eq!(r.mgr.read(&st, b), Some(86));
+    }
+
+    #[test]
+    fn a_feature_that_never_answers_is_unsupported() {
+        let r = rig();
+        let st = r.mgr.displays()[0].clone();
+        let sharp = feat("sharpness");
+        assert!(r.fake.register(0x87).is_none());
+        r.mgr.read(&st, sharp);
+        assert_eq!(r.mgr.status(&st, sharp), Status::Unsupported);
+        assert!(!r.mgr.visible(&st, sharp));
     }
 
     #[test]
