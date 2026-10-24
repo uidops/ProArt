@@ -3620,7 +3620,7 @@ checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
 name = "make-icons"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "png 0.17.16",
 ]
@@ -4491,7 +4491,7 @@ dependencies = [
 
 [[package]]
 name = "proart-app"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "gpui",
  "gtk",
@@ -4505,7 +4505,7 @@ dependencies = [
 
 [[package]]
 name = "proart-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "proart-core",
@@ -4514,7 +4514,7 @@ dependencies = [
 
 [[package]]
 name = "proart-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "libc",

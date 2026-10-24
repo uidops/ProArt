@@ -1,6 +1,6 @@
-; Inno Setup script for ProArt.  Build with:  iscc /DAppVersion=0.2.1 packaging\windows\proart.iss
+; Inno Setup script for ProArt.  Build with:  iscc /DAppVersion=0.2.2 packaging\windows\proart.iss
 #ifndef AppVersion
-  #define AppVersion "0.2.1"
+  #define AppVersion "0.2.2"
 #endif
 [Setup]
 AppId={{6B1F4E2A-5C3D-4E8B-9A07-PROART000001}
