@@ -1,0 +1,35 @@
+[package]
+name = "proart-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ProArt: menu-bar / tray app for ASUS ProArt monitors, built on GPUI"
+
+# not "ProArt": that would collide with the `proart` CLI on case-insensitive filesystems
+[[bin]]
+name = "proart-app"
+path = "src/main.rs"
+
+[features]
+# System tray on Linux needs GTK + libappindicator at build time.
+linux-tray = ["dep:tray-icon", "dep:gtk"]
+
+[dependencies]
+proart-core = { path = "../proart-core" }
+gpui = "0.2.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+unicode-segmentation = "1"
+log.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tray-icon = "0.26"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { version = "0.26", optional = true }
+gtk = { version = "0.18", optional = true }
+
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }

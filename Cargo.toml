@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/proart-core", "crates/proart-cli", "crates/proart-app", "tools/make-icons"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+authors = ["ProArt contributors"]
+repository = "https://github.com/uidops/ProArt"
+rust-version = "1.80"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

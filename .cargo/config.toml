@@ -1,0 +1,7 @@
+# C dependencies (ring, psm, ...) are built by the `cc` crate, which reads
+# CFLAGS/CXXFLAGS from the environment. A global `-flto=thin` there makes them
+# emit LLVM bitcode that the platform linker cannot read ("Invalid summary
+# version"), so pin them to empty for this workspace.
+[env]
+CFLAGS = { value = "", force = true }
+CXXFLAGS = { value = "", force = true }

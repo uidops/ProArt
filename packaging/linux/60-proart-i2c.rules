@@ -1,0 +1,3 @@
+# Let the logged-in user talk DDC/CI to monitors over /dev/i2c-N.
+# Install to /etc/udev/rules.d/ and run: sudo udevadm control --reload && sudo udevadm trigger
+KERNEL=="i2c-[0-9]*", TAG+="uaccess"

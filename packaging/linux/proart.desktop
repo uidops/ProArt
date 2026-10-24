@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ProArt
+Comment=Control ASUS ProArt monitors over DDC/CI
+Exec=proart-app
+Icon=proart
+Terminal=false
+Categories=Utility;Settings;HardwareSettings;
+StartupWMClass=proart

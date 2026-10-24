@@ -1,0 +1,39 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux system libraries (GPUI + i2c)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-x11-dev libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-xkb-dev \
+            libx11-xcb-dev libfontconfig-dev libasound2-dev libssl-dev libvulkan-dev pkg-config clang cmake
+      - name: Build
+        run: cargo build --release --workspace
+      - name: Test
+        run: cargo test --workspace
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: packaging/macos/build.sh
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proart-${{ runner.os }}
+          path: |
+            dist/*.dmg
+            dist/*.exe
+            target/release/proart-app
+            target/release/proart
+          if-no-files-found: ignore
